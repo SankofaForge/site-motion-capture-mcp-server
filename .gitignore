@@ -6,4 +6,3 @@ node_modules/
 *.webm
 *.jank.json
 .capture-*/
-.DS_Store
