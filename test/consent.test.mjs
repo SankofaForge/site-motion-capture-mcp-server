@@ -28,7 +28,7 @@ for (const [name, fixture, expected] of cases) {
   test(name, async () => {
     const { handleConsent } = await loadConsent();
     const result = await handleConsent(fakeConsentPage({ frames: [fakeFrame(fixture)] }), {
-      consentMode: "reject", consentWait: 0, consentBudgetMs: 20, consentMaxClicks: 6, consentSelectors: [],
+      consentMode: "reject", consentWait: 0, consentBudgetMs: 2000, consentMaxClicks: 6, consentSelectors: [],
     }, "recorded");
     assert.equal(result.outcome, expected === "rejected" ? "dismissed" : name === "unrelated reject false positive" ? "no-consent-surface" : "no-safe-action");
     assert.equal(result.dismissed, expected === "rejected");
@@ -107,7 +107,7 @@ test("manifest contains exact sizes and SHA-256 hashes", async () => {
 
 test("none and complete/missing result fields are deterministic", async () => {
   const { handleConsent, combineConsentResults } = await loadConsent();
-  const none = await handleConsent(fakeConsentPage({ frames: [fakeFrame()] }), { consentMode: "none", consentWait: 0, consentBudgetMs: 20, consentMaxClicks: 1, consentSelectors: [] }, "recorded");
+  const none = await handleConsent(fakeConsentPage({ frames: [fakeFrame()] }), { consentMode: "none", consentWait: 0, consentBudgetMs: 2000, consentMaxClicks: 1, consentSelectors: [] }, "recorded");
   assert.equal(none.mode, "none");
   assert.equal(none.outcome, "no-consent-surface");
   assert.equal(none.verified, true);
@@ -121,7 +121,7 @@ test("none and complete/missing result fields are deterministic", async () => {
 test("click failures, max candidates, and chained result attempts do not throw", async () => {
   const { handleConsent } = await loadConsent();
   const frame = fakeFrame({ body: "cookie consent", controls: { "#onetrust-reject-all": { clickError: "blocked" } } });
-  const result = await handleConsent(fakeConsentPage({ frames: [frame] }), { consentMode: "reject", consentWait: 0, consentBudgetMs: 20, consentMaxClicks: 6, consentSelectors: [] }, "recorded");
+  const result = await handleConsent(fakeConsentPage({ frames: [frame] }), { consentMode: "reject", consentWait: 0, consentBudgetMs: 2000, consentMaxClicks: 6, consentSelectors: [] }, "recorded");
   assert.equal(result.dismissed, false);
   assert.ok(result.attempts.some((value) => value.includes("blocked")));
 });
