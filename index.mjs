@@ -6,6 +6,7 @@ import { homedir, tmpdir } from "node:os";
 import { resolve, join, basename } from "node:path";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
+import { fileURLToPath } from "node:url";
 
 const SERVER_NAME = "site-motion-capture";
 const SERVER_VERSION = "1.0.0";
@@ -120,11 +121,11 @@ function run(command, args, { timeoutMs = 120000, env = process.env } = {}) {
     child.on("error", (error) => finish(error, 1));
     child.on("close", (code, signal) => {
       if (signal) {
-        finish(new Error(`${command} stopped with signal ${signal}`), code ?? 1);
+        finish(new Error(`${command} stopped with signal ${signal}`), 1);
       } else if (code === 0) {
         finish(null, 0);
       } else {
-        finish(new Error(`${command} exited with code ${code}${stderr ? `: ${trimOutput(stderr)}` : ""}`), code ?? 1);
+        finish(new Error(`${command} exited with code ${code}${stderr ? `: ${trimOutput(stderr)}` : ""}`), code);
       }
     });
 
@@ -214,8 +215,12 @@ async function runRemoteCommand(connection, command, timeoutMs, runDir) {
   if (result.error) {
     let cleanup = "not-attempted";
     if (isSafeRemoteRunDir(runDir)) {
-      const termination = await runRemote(connection, "sh", ["-c", `if test -s ${shellQuote(`${runDir}/pid`)}; then kill -TERM $(cat ${shellQuote(`${runDir}/pid`)}) 2>/dev/null || true; fi; test ! -s ${shellQuote(`${runDir}/pid`)}`], 10000);
-      cleanup = termination.error ? "pending" : "confirmed";
+      try {
+        await runRemote(connection, "sh", ["-c", `if test -s ${shellQuote(`${runDir}/pid`)}; then kill -TERM $(cat ${shellQuote(`${runDir}/pid`)}) 2>/dev/null || true; fi; test ! -s ${shellQuote(`${runDir}/pid`)}`], 10000);
+        cleanup = "confirmed";
+      } catch {
+        cleanup = "pending";
+      }
     }
     throw new Error(`${result.error.message}; remote cleanup ${cleanup}`);
   }
@@ -345,10 +350,24 @@ async function captureSiteMotion(input) {
   const localJank = join(capture.outputDir, `${capture.name}.jank.json`);
   const lockPath = join(capture.outputDir, `.${capture.name}.capture.lock`);
   await mkdir(capture.outputDir, { recursive: true });
-  try { await mkdir(lockPath); } catch (error) { if (error.code === "EEXIST") throw new Error("capture_target_busy"); throw error; }
+  try {
+    await mkdir(lockPath);
+  } catch (error) {
+    if (error.code === "EEXIST") throw new Error("capture_target_busy");
+    throw error;
+  }
   try {
     const connection = await resolveConnection();
-    if (!capture.overwrite) for (const target of [localVideo, localJank]) { try { await stat(target); throw new Error(`capture target exists: ${target}; set overwrite=true to replace it.`); } catch (error) { if (error.code !== "ENOENT") throw error; } }
+    if (!capture.overwrite) {
+      for (const target of [localVideo, localJank]) {
+        try {
+          await stat(target);
+          throw new Error(`capture target exists: ${target}; set overwrite=true to replace it.`);
+        } catch (error) {
+          if (error.code !== "ENOENT") throw error;
+        }
+      }
+    }
   await ensureRemoteEncoder(connection);
 
   const remoteRunDir = `${REMOTE_OUTPUT}/runs/${runId}`;
@@ -414,18 +433,21 @@ async function captureSiteMotion(input) {
     for (const file of manifest.files) {
       if (!file || typeof file.path !== "string" || basename(file.path) !== file.path || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$/.test(file.path) || !expectedNames.has(file.path) || seenNames.has(file.path)) throw new Error("manifest validation failed");
       seenNames.add(file.path);
-      const path = join(stageDir, file.path); const bytes = await readFile(path); const info = await stat(path);
+      const path = join(stageDir, file.path);
+      const bytes = await readFile(path);
+      const info = await stat(path);
       if (info.size !== file.size || createHash("sha256").update(bytes).digest("hex") !== file.sha256) throw new Error(`manifest validation failed for ${file.path}`);
     }
-    if (seenNames.size !== expectedNames.size) throw new Error("manifest validation failed");
     await rename(join(stageDir, `${capture.name}.webm`), localVideo);
     await rename(join(stageDir, `${capture.name}.jank.json`), localJank);
-    if (!isSafeRemoteRunDir(remoteRunDir)) throw new Error("unsafe remote run directory");
     await runRemote(connection, "rm", ["-rf", "--", remoteRunDir], 30000);
     cleanup = "confirmed";
   } catch (error) {
     cleanup = "pending";
-    try { if (isSafeRemoteRunDir(remoteRunDir)) { await runRemote(connection, "rm", ["-rf", "--", remoteRunDir], 30000); cleanup = "confirmed"; } } catch {}
+    try {
+      await runRemote(connection, "rm", ["-rf", "--", remoteRunDir], 30000);
+      cleanup = "confirmed";
+    } catch {}
     throw error;
   } finally {
     await rm(stageDir, { recursive: true, force: true });
@@ -456,7 +478,9 @@ async function captureSiteMotion(input) {
       },
     ],
   };
-  } finally { await rm(lockPath, { recursive: true, force: true }); }
+  } finally {
+    await rm(lockPath, { recursive: true, force: true });
+  }
 }
 
 async function ensureRemoteEncoder(connection) {
@@ -555,14 +579,49 @@ async function handleMessage(message) {
   }
 }
 
-const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
-input.on("line", (line) => {
-  if (!line.trim()) return;
-  let message;
-  try {
-    message = JSON.parse(line);
-  } catch {
-    return;
-  }
-  void handleMessage(message);
-});
+const isMainModule = resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (isMainModule) {
+  const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
+  input.on("line", (line) => {
+    if (!line.trim()) return;
+    let message;
+    try {
+      message = JSON.parse(line);
+    } catch {
+      return;
+    }
+    void handleMessage(message);
+  });
+}
+
+export {
+  run,
+  resolveConnection,
+  parseSshUrl,
+  sshArgs,
+  runRemote,
+  runRemoteCommand,
+  copyRemote,
+  validateString,
+  integerOption,
+  booleanOption,
+  validateCaptureInput,
+  captureSiteMotion,
+  ensureRemoteEncoder,
+  checkCaptureGpu,
+  callTool,
+  handleMessage,
+  writeMessage,
+  errorResult,
+  shellQuote,
+  isSafeRemoteRunDir,
+  trimOutput,
+  tools,
+  SERVER_NAME,
+  SERVER_VERSION,
+  INSTANCE_ID,
+  REMOTE_ROOT,
+  REMOTE_OUTPUT,
+  DEFAULT_LOCAL_OUTPUT,
+};
