@@ -14,7 +14,20 @@ jobs:
       pull-requests: write
     runs-on: ubuntu-latest
     steps:
-      - run: gh pr merge --auto --squash "$PR_URL"
+      - name: Enable auto-merge
+        run: |
+          output=$(gh pr merge --auto --squash "$PR_URL" 2>&1) || {
+            case "$output" in
+              *"already in progress"*|*"already auto-merged"*|*"already merged"*|*"not open"*)
+                echo "Auto-merge already handled: $output"
+                exit 0
+                ;;
+              *)
+                echo "::error::$output"
+                exit 1
+                ;;
+            esac
+          }
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           PR_URL: ${{ github.event.pull_request.html_url }}
