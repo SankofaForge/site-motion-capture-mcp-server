@@ -8,7 +8,7 @@
   },
   "scripts": {
     "test": "node --test test/*.test.mjs",
-    "test:coverage": "node --experimental-test-coverage --test test/*.test.mjs"
+    "test:coverage": "node --experimental-test-coverage --test-coverage-lines=100 --test-coverage-branches=100 --test-coverage-functions=100 --test-coverage-include=index.mjs --test test/*.test.mjs"
   },
   "engines": {
     "node": ">=18"
