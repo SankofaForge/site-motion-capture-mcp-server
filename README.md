@@ -7,6 +7,14 @@ jank report to the local machine.
 Use `design-inspiration` to find candidate sites. Use this server after a site
 has been selected and its live behavior needs inspection.
 
+In Antigravity, pass the returned local `.webm` path directly to native video
+understanding for the motion analysis step. Do not start the standalone
+`gemini-vision` MCP or upload the recording through the Gemini API for this
+workflow. Ask the native analyzer for a concise description and at most eight
+timestamped moments using the shape `{ description, moments: [{ timestamp_s,
+why }] }`, then use those timestamps for frame extraction and implementation
+planning.
+
 ## Tools
 
 - `capture_site_motion` records page load, scroll, and optional hover or click
