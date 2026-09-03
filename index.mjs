@@ -2,7 +2,7 @@
 
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, stat } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { resolve, join, basename } from "node:path";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
@@ -13,7 +13,9 @@ const SERVER_VERSION = "1.0.0";
 const INSTANCE_ID = process.env.VAST_INSTANCE_ID || "48790763";
 const REMOTE_ROOT = process.env.SITE_MOTION_REMOTE_ROOT || "/workspace/site-motion-capture";
 const REMOTE_OUTPUT = process.env.SITE_MOTION_REMOTE_OUTPUT || `${REMOTE_ROOT}/out`;
-const DEFAULT_LOCAL_OUTPUT = process.env.SITE_MOTION_OUTPUT_DIR || join(tmpdir(), "site-motion-capture");
+const DEFAULT_LOCAL_OUTPUT =
+  process.env.SITE_MOTION_OUTPUT_DIR ||
+  join(process.cwd(), "artifacts", "design-inspiration", "site-motion-capture");
 
 const tools = [
   {
@@ -56,7 +58,8 @@ const tools = [
         },
         output_dir: {
           type: "string",
-          description: "The local directory for the WebM video and jank report. Defaults to a temporary directory.",
+          description:
+            "The local directory for the WebM video and jank report. Defaults to artifacts/design-inspiration/site-motion-capture in the MCP client's current workspace.",
         },
         settle_ms: { type: "integer", minimum: 0, maximum: 30000, default: 2000 },
         scroll_distance: { type: "integer", minimum: 0, maximum: 20000, default: 2500 },

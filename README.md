@@ -66,10 +66,12 @@ not prove that every interaction was captured.
 
 The local `name` is a stable file stem for the copied `.webm` and `.jank.json`
 files. It is not the remote run ID. Keep the local name stable when comparing
-runs. Use the remote run ID for remote logs and cleanup. Use `overwrite: false`
-when available so an existing local capture is preserved. Cleanup reports one
-status per artifact: `removed`, `missing`, `skipped`, or `failed`. A cleanup
-failure does not mean that the capture failed.
+runs. Use the remote run ID for remote logs and cleanup. Unless `output_dir` or
+`SITE_MOTION_OUTPUT_DIR` is supplied, local artifacts are saved under
+`artifacts/design-inspiration/site-motion-capture/` in the MCP client's current
+workspace. Use `overwrite: false` when available so an existing local capture
+is preserved. Cleanup reports one status per artifact: `removed`, `missing`,
+`skipped`, or `failed`. A cleanup failure does not mean that the capture failed.
 
 ## Runtime
 
