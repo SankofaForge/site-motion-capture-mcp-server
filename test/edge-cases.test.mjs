@@ -729,74 +729,69 @@ if (arg.includes("nvidia-smi")) {
 
 test("handleMessage() error formatting for Error instance vs non-Error values", async () => {
   const writes = [];
-  const originalWrite = process.stdout.write;
-  process.stdout.write = (chunk) => {
-    writes.push(chunk);
-    return true;
-  };
+  const write = (message) => writes.push(`${JSON.stringify(message)}\n`);
 
-  try {
-    // 1. null / non-object message ignored
-    await handleMessage(null);
-    await handleMessage("string-message");
-    assert.equal(writes.length, 0);
+  // 1. null / non-object message ignored
+  await handleMessage(null, write);
+  await handleMessage("string-message", write);
+  assert.equal(writes.length, 0);
 
-    // 2. message without id ignored
-    await handleMessage({ jsonrpc: "2.0", method: "notification" });
-    assert.equal(writes.length, 0);
+  // 2. message without id ignored
+  await handleMessage({ jsonrpc: "2.0", method: "notification" }, write);
+  assert.equal(writes.length, 0);
 
-    // 3. initialize method
-    await handleMessage({ jsonrpc: "2.0", id: 980, method: "initialize" });
-    assert.equal(writes.length, 1);
-    const initReply = JSON.parse(writes[0]);
-    assert.equal(initReply.result.serverInfo.name, SERVER_NAME);
-    assert.equal(initReply.result.serverInfo.version, SERVER_VERSION);
+  // 3. initialize method
+  await handleMessage({ jsonrpc: "2.0", id: 980, method: "initialize" }, write);
+  assert.equal(writes.length, 1);
+  const initReply = JSON.parse(writes[0]);
+  assert.equal(initReply.result.serverInfo.name, SERVER_NAME);
+  assert.equal(initReply.result.serverInfo.version, SERVER_VERSION);
 
-    // 4. ping method
-    await handleMessage({ jsonrpc: "2.0", id: 981, method: "ping" });
-    assert.equal(writes.length, 2);
-    assert.deepEqual(JSON.parse(writes[1]).result, {});
+  // 4. ping method
+  await handleMessage({ jsonrpc: "2.0", id: 981, method: "ping" }, write);
+  assert.equal(writes.length, 2);
+  assert.deepEqual(JSON.parse(writes[1]).result, {});
 
-    // 5. tools/list method
-    await handleMessage({ jsonrpc: "2.0", id: 982, method: "tools/list" });
-    assert.equal(writes.length, 3);
-    assert.equal(JSON.parse(writes[2]).result.tools.length, tools.length);
+  // 5. tools/list method
+  await handleMessage({ jsonrpc: "2.0", id: 982, method: "tools/list" }, write);
+  assert.equal(writes.length, 3);
+  assert.equal(JSON.parse(writes[2]).result.tools.length, tools.length);
 
-    // 6. tool call with params but missing arguments property
-    await handleMessage({
-      jsonrpc: "2.0",
-      id: 983,
-      method: "tools/call",
-      params: { name: "unknown" },
-    });
-    assert.equal(writes.length, 4);
-    assert.equal(JSON.parse(writes[3]).result.isError, true);
+  // 6. tool call with params but missing arguments property
+  await handleMessage({
+    jsonrpc: "2.0",
+    id: 983,
+    method: "tools/call",
+    params: { name: "unknown" },
+  }, write);
+  assert.equal(writes.length, 4);
+  assert.equal(JSON.parse(writes[3]).result.isError, true);
 
-    // 7. tool call without params
-    await handleMessage({
-      jsonrpc: "2.0",
-      id: 984,
-      method: "tools/call",
-    });
-    assert.equal(writes.length, 5);
-    assert.equal(JSON.parse(writes[4]).result.isError, true);
+  // 7. tool call without params
+  await handleMessage({
+    jsonrpc: "2.0",
+    id: 984,
+    method: "tools/call",
+  }, write);
+  assert.equal(writes.length, 5);
+  assert.equal(JSON.parse(writes[4]).result.isError, true);
 
-    // 8. unsupported method
-    await handleMessage({
-      jsonrpc: "2.0",
-      id: 985,
-      method: "unknown_rpc_method",
-    });
-    assert.equal(writes.length, 6);
-    assert.equal(JSON.parse(writes[5]).error.code, -32601);
+  // 8. unsupported method
+  await handleMessage({
+    jsonrpc: "2.0",
+    id: 985,
+    method: "unknown_rpc_method",
+  }, write);
+  assert.equal(writes.length, 6);
+  assert.equal(JSON.parse(writes[5]).error.code, -32601);
 
-    // 9. tool call throwing an Error
+  // 9. tool call throwing an Error
     await handleMessage({
       jsonrpc: "2.0",
       id: 991,
       method: "tools/call",
       params: { name: "capture_site_motion", arguments: { url: "invalid" } },
-    });
+    }, write);
     assert.equal(writes.length, 7);
     const reply1 = JSON.parse(writes[6]);
     assert.equal(reply1.id, 991);
@@ -810,26 +805,32 @@ test("handleMessage() error formatting for Error instance vs non-Error values", 
       get method() {
         throw "primitive-string-error";
       },
-    });
+    }, write);
     assert.equal(writes.length, 8);
     const reply2 = JSON.parse(writes[7]);
     assert.equal(reply2.id, 992);
     assert.equal(reply2.result.isError, true);
     assert.equal(reply2.result.content[0].text, "primitive-string-error");
 
-    // 11. writeMessage and errorResult
+  // 11. writeMessage and errorResult
+  const originalWrite = process.stdout.write;
+  let directWrite;
+  process.stdout.write = (chunk) => {
+    directWrite = chunk;
+    return true;
+  };
+  try {
     writeMessage({ test: 123 });
-    assert.equal(writes.length, 9);
-    assert.deepEqual(JSON.parse(writes[8]), { test: 123 });
+  } finally {
+    process.stdout.write = originalWrite;
+  }
+  assert.equal(directWrite, '{"test":123}\n');
 
     const errRes = errorResult("custom-err");
     assert.deepEqual(errRes, {
       content: [{ type: "text", text: "custom-err" }],
       isError: true,
     });
-  } finally {
-    process.stdout.write = originalWrite;
-  }
 });
 
 test("additional branch coverage for input parameters and http urls", () => {

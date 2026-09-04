@@ -535,13 +535,14 @@ async function callTool(name, input) {
   return errorResult(`Unknown tool: ${name}`);
 }
 
-async function handleMessage(message) {
+async function handleMessage(message, write) {
   if (!message || typeof message !== "object") return;
-  if (message.id === undefined) return;
 
   try {
+    if (message.id === undefined) return;
+
     if (message.method === "initialize") {
-      writeMessage({
+      write({
         jsonrpc: "2.0",
         id: message.id,
         result: {
@@ -555,26 +556,26 @@ async function handleMessage(message) {
       return;
     }
     if (message.method === "ping") {
-      writeMessage({ jsonrpc: "2.0", id: message.id, result: {} });
+      write({ jsonrpc: "2.0", id: message.id, result: {} });
       return;
     }
     if (message.method === "tools/list") {
-      writeMessage({ jsonrpc: "2.0", id: message.id, result: { tools } });
+      write({ jsonrpc: "2.0", id: message.id, result: { tools } });
       return;
     }
     if (message.method === "tools/call") {
       const name = message.params?.name;
       const result = await callTool(name, message.params?.arguments || {});
-      writeMessage({ jsonrpc: "2.0", id: message.id, result });
+      write({ jsonrpc: "2.0", id: message.id, result });
       return;
     }
-    writeMessage({
+    write({
       jsonrpc: "2.0",
       id: message.id,
       error: { code: -32601, message: `Unsupported method: ${message.method}` },
     });
   } catch (error) {
-    writeMessage({
+    write({
       jsonrpc: "2.0",
       id: message.id,
       result: errorResult(error instanceof Error ? error.message : String(error)),
@@ -594,7 +595,7 @@ if (isMainModule) {
     } catch {
       return;
     }
-    void handleMessage(message);
+    void handleMessage(message, writeMessage);
   });
 }
 

@@ -5,4 +5,5 @@ node_modules/
 *.log
 *.webm
 *.jank.json
+.v8cov/
 .capture-*/
