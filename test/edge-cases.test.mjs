@@ -679,7 +679,28 @@ if (arg.includes("node ") && arg.includes("capture.mjs")) {
         output_dir: join(filePathAsDir, "nested"),
       }),
     /ENOTDIR|EEXIST/
+    (err) => err.code !== "EEXIST"
   );
+
+  // Non-ENOENT error on stat (e.g. EACCES on stat)
+  const unreadableDir = await tempDir("unreadable-");
+  const lockInUnreadable = join(unreadableDir, ".perm-test.capture.lock");
+  await mkdir(lockInUnreadable); // create lock in advance so mkdir doesn't fail
+  await chmod(unreadableDir, 0o000);
+  try {
+    await assert.rejects(
+      async () =>
+        captureSiteMotion({
+          url: "https://example.test",
+          name: "perm-test",
+          output_dir: unreadableDir,
+          overwrite: false,
+        }),
+      (err) => err.code !== "ENOENT"
+    );
+  } finally {
+    await chmod(unreadableDir, 0o777);
+  }
 });
 
 test("ensureRemoteEncoder(), checkCaptureGpu(), callTool() error cases", async () => {
@@ -797,6 +818,17 @@ test("handleMessage() error formatting for Error instance vs non-Error values", 
     assert.equal(reply1.id, 991);
     assert.equal(reply1.result.isError, true);
     assert.match(reply1.result.content[0].text, /valid HTTP or HTTPS URL/);
+  await handleMessage({
+    jsonrpc: "2.0",
+    id: 991,
+    method: "tools/call",
+    params: { name: "capture_site_motion", arguments: { url: "invalid" } },
+  }, write);
+  assert.equal(writes.length, 7);
+  const reply1 = JSON.parse(writes[6]);
+  assert.equal(reply1.id, 991);
+  assert.equal(reply1.result.isError, true);
+  assert.match(reply1.result.content[0].text, /valid HTTP or HTTPS URL/);
 
     // 10. non-Error thrown during message handling
     await handleMessage({
@@ -811,6 +843,19 @@ test("handleMessage() error formatting for Error instance vs non-Error values", 
     assert.equal(reply2.id, 992);
     assert.equal(reply2.result.isError, true);
     assert.equal(reply2.result.content[0].text, "primitive-string-error");
+  // 10. non-Error thrown during message handling
+  await handleMessage({
+    jsonrpc: "2.0",
+    id: 992,
+    get method() {
+      throw "primitive-string-error";
+    },
+  }, write);
+  assert.equal(writes.length, 8);
+  const reply2 = JSON.parse(writes[7]);
+  assert.equal(reply2.id, 992);
+  assert.equal(reply2.result.isError, true);
+  assert.equal(reply2.result.content[0].text, "primitive-string-error");
 
   // 11. writeMessage and errorResult
   const originalWrite = process.stdout.write;
@@ -831,6 +876,11 @@ test("handleMessage() error formatting for Error instance vs non-Error values", 
       content: [{ type: "text", text: "custom-err" }],
       isError: true,
     });
+  const errRes = errorResult("custom-err");
+  assert.deepEqual(errRes, {
+    content: [{ type: "text", text: "custom-err" }],
+    isError: true,
+  });
 });
 
 test("additional branch coverage for input parameters and http urls", () => {
@@ -854,6 +904,55 @@ test("additional branch coverage for input parameters and http urls", () => {
   assert.equal(httpInput.hoverSelector, ".hover");
   assert.equal(httpInput.clickSelector, ".click");
   assert.equal(httpInput.consentSelector, ".consent");
+
+  // Invalid protocol
+  assert.throws(
+    () => validateCaptureInput({ url: "ftp://example.test" }),
+    /url must use http:\/\/ or https:\/\/\./
+  );
+
+  // Invalid consent_mode
+  assert.throws(
+    () => validateCaptureInput({ url: "https://example.test", consent_mode: "invalid-mode" }),
+    /consent_mode must be reject, accept, none, or granular\./
+  );
+
+  // Granular consent with missing selector
+  assert.throws(
+    () => validateCaptureInput({ url: "https://example.test", consent_mode: "granular" }),
+    /granular consent_mode requires consent_settings_selector, consent_optional_selector, and consent_save_selector\./
+  );
+
+  // Accept consent without explicit approval
+  assert.throws(
+    () => validateCaptureInput({ url: "https://example.test", consent_mode: "accept", consent_accept_approved: false }),
+    /accept consent_mode requires explicit consent_accept_approved=true\./
+  );
+});
+
+test("resolveConnection vastai error and missing endpoint branches", async () => {
+  const bin = await shimBin();
+  const prevPath = process.env.PATH;
+  const prevUrl = process.env.SITE_MOTION_SSH_URL;
+  const prevHost = process.env.SITE_MOTION_SSH_HOST;
+  const prevPort = process.env.SITE_MOTION_SSH_PORT;
+  delete process.env.SITE_MOTION_SSH_URL;
+  delete process.env.SITE_MOTION_SSH_HOST;
+  delete process.env.SITE_MOTION_SSH_PORT;
+  process.env.PATH = `${bin}:${process.env.PATH}`;
+
+  try {
+    await writeExecutable(bin, "vastai", "process.exit(1);");
+    await assert.rejects(() => resolveConnection(), /Could not resolve the Vast SSH endpoint/);
+
+    await writeExecutable(bin, "vastai", "process.stdout.write('invalid\\n');");
+    await assert.rejects(() => resolveConnection(), /The Vast CLI did not return an SSH endpoint/);
+  } finally {
+    process.env.PATH = prevPath;
+    if (prevUrl !== undefined) process.env.SITE_MOTION_SSH_URL = prevUrl;
+    if (prevHost !== undefined) process.env.SITE_MOTION_SSH_HOST = prevHost;
+    if (prevPort !== undefined) process.env.SITE_MOTION_SSH_PORT = prevPort;
+  }
 });
 
 test("server startup initializes custom environment variables", async () => {
