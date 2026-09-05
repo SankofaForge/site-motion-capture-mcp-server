@@ -678,7 +678,6 @@ if (arg.includes("node ") && arg.includes("capture.mjs")) {
         name: "test-non-eexist",
         output_dir: join(filePathAsDir, "nested"),
       }),
-    /ENOTDIR|EEXIST/
     (err) => err.code !== "EEXIST"
   );
 
@@ -807,17 +806,6 @@ test("handleMessage() error formatting for Error instance vs non-Error values", 
   assert.equal(JSON.parse(writes[5]).error.code, -32601);
 
   // 9. tool call throwing an Error
-    await handleMessage({
-      jsonrpc: "2.0",
-      id: 991,
-      method: "tools/call",
-      params: { name: "capture_site_motion", arguments: { url: "invalid" } },
-    }, write);
-    assert.equal(writes.length, 7);
-    const reply1 = JSON.parse(writes[6]);
-    assert.equal(reply1.id, 991);
-    assert.equal(reply1.result.isError, true);
-    assert.match(reply1.result.content[0].text, /valid HTTP or HTTPS URL/);
   await handleMessage({
     jsonrpc: "2.0",
     id: 991,
@@ -830,19 +818,6 @@ test("handleMessage() error formatting for Error instance vs non-Error values", 
   assert.equal(reply1.result.isError, true);
   assert.match(reply1.result.content[0].text, /valid HTTP or HTTPS URL/);
 
-    // 10. non-Error thrown during message handling
-    await handleMessage({
-      jsonrpc: "2.0",
-      id: 992,
-      get method() {
-        throw "primitive-string-error";
-      },
-    }, write);
-    assert.equal(writes.length, 8);
-    const reply2 = JSON.parse(writes[7]);
-    assert.equal(reply2.id, 992);
-    assert.equal(reply2.result.isError, true);
-    assert.equal(reply2.result.content[0].text, "primitive-string-error");
   // 10. non-Error thrown during message handling
   await handleMessage({
     jsonrpc: "2.0",
@@ -871,11 +846,6 @@ test("handleMessage() error formatting for Error instance vs non-Error values", 
   }
   assert.equal(directWrite, '{"test":123}\n');
 
-    const errRes = errorResult("custom-err");
-    assert.deepEqual(errRes, {
-      content: [{ type: "text", text: "custom-err" }],
-      isError: true,
-    });
   const errRes = errorResult("custom-err");
   assert.deepEqual(errRes, {
     content: [{ type: "text", text: "custom-err" }],
