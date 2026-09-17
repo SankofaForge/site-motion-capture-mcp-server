@@ -40,6 +40,19 @@ test("run() handles timeouts, stderr data, error events, signals, and exit codes
   assert.equal(timeoutResult.code, 124);
   assert.match(timeoutResult.error.message, /timed out after 50 ms/);
 
+  // Timeout with escalated SIGKILL when process ignores SIGTERM
+  const sigkillResult = await run(
+    process.execPath,
+    ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);"],
+    {
+      timeoutMs: 50,
+      killDelayMs: 20,
+    }
+  );
+  assert.equal(sigkillResult.code, 124);
+  assert.match(sigkillResult.error.message, /timed out after 50 ms/);
+  await new Promise((resolve) => setTimeout(resolve, 60));
+
   // Stderr data and non-zero exit with stderr
   const stderrResult = await run(process.execPath, [
     "-e",
@@ -636,6 +649,27 @@ if (dest.endsWith("manifest.json")) {
     const parsedReport = JSON.parse(resultNoConsent.content[0].text);
     assert.equal(parsedReport.consent, null);
     assert.equal(parsedReport.cleanup, "confirmed");
+
+    // Successful capture covering mobile, no-scroll, selectors, and consent accept approved
+    const resultFullOptions = await captureSiteMotion({
+      url: "https://example.test",
+      name: "no-consent",
+      output_dir: out,
+      overwrite: true,
+      gpu: true,
+      mobile: true,
+      no_scroll: true,
+      consent_preflight: true,
+      consent_selector: "#consent-btn",
+      consent_settings_selector: "#settings-btn",
+      consent_optional_selector: "#opt-btn",
+      consent_save_selector: "#save-btn",
+      hover_selector: "#hover-target",
+      click_selector: "#click-target",
+      consent_accept_approved: true,
+    });
+    const parsedFullReport = JSON.parse(resultFullOptions.content[0].text);
+    assert.equal(parsedFullReport.cleanup, "confirmed");
 
     // Capture failure when remote rm cleanup in catch block fails -> cleanup stays pending
     await writeExecutable(

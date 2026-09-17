@@ -100,7 +100,7 @@ function isSafeRemoteRunDir(value) {
   return new RegExp(`^${REMOTE_OUTPUT.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")}/runs/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`).test(value);
 }
 
-function run(command, args, { timeoutMs = 120000, env = process.env } = {}) {
+function run(command, args, { timeoutMs = 120000, env = process.env, killDelayMs = 5000 } = {}) {
   return new Promise((resolveRun, rejectRun) => {
     const child = spawn(command, args, {
       env,
@@ -111,7 +111,7 @@ function run(command, args, { timeoutMs = 120000, env = process.env } = {}) {
     let settled = false;
     const timer = setTimeout(() => {
       child.kill("SIGTERM");
-      setTimeout(() => child.kill("SIGKILL"), 5000).unref();
+      setTimeout(() => child.kill("SIGKILL"), killDelayMs).unref();
       finish(new Error(`${command} timed out after ${timeoutMs} ms`), 124);
     }, timeoutMs);
 
