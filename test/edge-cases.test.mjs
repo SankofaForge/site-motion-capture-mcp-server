@@ -933,6 +933,29 @@ test("additional branch coverage for input parameters and http urls", () => {
     () => validateCaptureInput({ url: "https://example.test", consent_mode: "accept", consent_accept_approved: false }),
     /accept consent_mode requires explicit consent_accept_approved=true\./
   );
+
+  for (const url of [
+    "http://localhost/admin",
+    "https://foo.localhost/admin",
+    "https://foo.local/admin",
+    "http://127.0.0.1/admin",
+    "http://10.0.0.1/admin",
+    "http://169.254.169.254/admin",
+    "http://172.16.0.1/admin",
+    "http://172.31.0.1/admin",
+    "http://[::1]/admin",
+    "http://[fc00::1]/admin",
+    "http://[fd00::1]/admin",
+    "http://[fe80::1]/admin",
+    "https://user:pass@example.test/",
+  ]) {
+    assert.throws(() => validateCaptureInput({ url }), /public HTTP\(S\) host without credentials/);
+  }
+  assert.doesNotThrow(() => validateCaptureInput({ url: "http://172.15.0.1/" }));
+  assert.throws(
+    () => validateCaptureInput({ url: "https://example.test", output_dir: "/etc/site-motion-capture" }),
+    /approved workspace output root/
+  );
 });
 
 test("resolveConnection vastai error and missing endpoint branches", async () => {
