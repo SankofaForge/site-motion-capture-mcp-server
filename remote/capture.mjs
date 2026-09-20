@@ -160,7 +160,7 @@ async function collectJankReport(page, args, phases, consent) {
   const totalBlockingTimeMs = longTasks.reduce((sum, e) => sum + (e.duration - LONG_TASK_THRESHOLD_MS), 0);
   const choppy = totalBlockingTimeMs > args.jankThreshold;
   return {
-    schemaVersion: "motion-analysis.v2",
+    schemaVersion: "jank-report.v1",
     consent,
     finalUrl: page.url(),
     longTaskCount: longTasks.length,
@@ -169,6 +169,7 @@ async function collectJankReport(page, args, phases, consent) {
     choppy,
     byPhase: bucketByPhase(longTasks, phases),
     longTasks,
+    observerError: await page.evaluate(() => window.__jankObserverError || null).catch(() => "observer_unavailable"),
   };
 }
 
@@ -429,8 +430,9 @@ async function runConsentBounded(page, args, phase) {
 function combineConsentResults(mode, preflight, recorded) {
   const results = [preflight, recorded].filter(Boolean);
   const final = recorded || results[results.length - 1] || emptyConsentResult(mode, "aggregate");
+  const blindSpots = results.flatMap((result) => result.blindSpots || []);
   return {
-    mode, verified: Boolean(final.verified), dismissed: Boolean(final.dismissed), actionTaken: results.some((r) => r.actionTaken), outcome: final.outcome || "not-attempted",
+    mode, verified: Boolean(final.verified) && blindSpots.length === 0, dismissed: Boolean(final.dismissed), blindSpots, actionTaken: results.some((r) => r.actionTaken), outcome: final.outcome || "not-attempted",
     action: final.action || "none",
     selector: final.selector || null,
     preflight: preflight || null,
@@ -448,7 +450,7 @@ async function writeManifest(out, files, runId, metadata = {}) {
     entries.push({ path: path.basename(file), size: info.size, sha256: hash.digest("hex") });
   }
   const source = await readFile(new URL(import.meta.url).protocol === "file:" ? new URL(import.meta.url) : path.join(process.cwd(), "remote/capture.mjs"));
-  const manifest = { contractVersion: "1.1.0", runId: runId || `${Date.now()}-${process.pid}`, generatedAt: new Date().toISOString(), recorder: { version: RECORDER_VERSION, sha256: createHash("sha256").update(source).digest("hex") }, ...metadata, files: entries };
+  const manifest = { contractVersion: "capture-cell.v2", runId: runId || `${Date.now()}-${process.pid}`, generatedAt: new Date().toISOString(), recorder: { version: RECORDER_VERSION, sha256: createHash("sha256").update(source).digest("hex") }, ...metadata, files: entries };
   const manifestPath = path.join(out, "manifest.json");
   await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
   return manifestPath;
@@ -658,7 +660,7 @@ async function main() {
   if (jankReport) {
     jankReport.interactionFailures = interactionFailures;
     jankReport.scroll = scrollEvidence;
-    jankReport.status = interactionFailures.length || scrollEvidence.timedOut || consent?.blindSpots?.length ? "partial" : "valid";
+    jankReport.status = interactionFailures.length || scrollEvidence.timedOut || consent?.blindSpots?.length || consent?.verified === false || jankReport.observerError ? "partial" : "valid";
   }
 
   const video = page.video();

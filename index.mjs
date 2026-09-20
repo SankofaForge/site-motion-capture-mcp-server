@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { createHash, randomUUID } from "node:crypto";
+import { lookup } from "node:dns/promises";
 import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { resolve, join, basename, relative, isAbsolute } from "node:path";
@@ -10,7 +11,7 @@ import { fileURLToPath } from "node:url";
 
 const SERVER_NAME = "site-motion-capture";
 const SERVER_VERSION = "1.0.0";
-const CONTRACT_VERSION = "1.1.0";
+const CONTRACT_VERSION = "capture-cell.v2";
 const INSTANCE_ID = process.env.VAST_INSTANCE_ID || "48790763";
 const REMOTE_ROOT = process.env.SITE_MOTION_REMOTE_ROOT || "/workspace/site-motion-capture";
 const REMOTE_OUTPUT = process.env.SITE_MOTION_REMOTE_OUTPUT || `${REMOTE_ROOT}/out`;
@@ -398,6 +399,7 @@ function validateCaptureInput(input) {
 
 async function captureSiteMotion(input) {
   const capture = validateCaptureInput(input);
+  await assertPublicResolution(capture.url);
   let gpuCheckFailure = null;
   if (capture.gpu) {
     const check = capture.gpuCheckId ? gpuChecks.get(capture.gpuCheckId) : undefined;
@@ -407,7 +409,7 @@ async function captureSiteMotion(input) {
   const runId = randomUUID();
   const localVideo = join(capture.outputDir, `${capture.name}.webm`);
   const localJank = join(capture.outputDir, `${capture.name}.jank.json`);
-  const localManifest = join(capture.outputDir, `${capture.name}.manifest.json`);
+  const localManifest = join(capture.outputDir, `${capture.name}.capture-cell.v2.json`);
   const lockPath = join(capture.outputDir, `.${capture.name}.capture.lock`);
   await mkdir(capture.outputDir, { recursive: true });
   try {
@@ -508,13 +510,14 @@ async function captureSiteMotion(input) {
     const localManifestData = {
       ...manifest,
       contractVersion: CONTRACT_VERSION,
+      cellId: `${capture.mobile ? "mobile" : "desktop"}-${capture.reducedMotion ? "reduced" : "full"}`,
       url: capture.url,
       finalUrl: jankReport.finalUrl || capture.url,
       viewport: manifest.viewport || { width: capture.width, height: capture.height, mobile: capture.mobile, reducedMotion: capture.reducedMotion },
       modes: { gpu: capture.gpu, scroll: !capture.noScroll },
       validation: { media: mediaValidation, jank: { status: "valid" } },
       cleanup: "pending",
-      status: mediaValidation.status === "valid" && jankReport.status === "valid" && cleanup === "pending" && !gpuCheckFailure ? "complete" : "partial",
+      status: mediaValidation.status === "valid" && jankReport.status === "valid" && !gpuCheckFailure ? "complete" : "partial",
       evidence: {
         gpu: gpuCheckFailure ? { status: "blocked", reason: gpuCheckFailure } : { status: "verified" },
         consent: jankReport.consent || null,
@@ -538,6 +541,7 @@ async function captureSiteMotion(input) {
   const jankReport = JSON.parse(await readFile(localJank, "utf8"));
   const manifest = JSON.parse(await readFile(localManifest, "utf8"));
   manifest.cleanup = cleanup;
+  if (cleanup !== "confirmed" && manifest.status === "complete") manifest.status = "partial";
   await writeFile(localManifest, JSON.stringify(manifest, null, 2));
   const contract = {
     contractVersion: CONTRACT_VERSION,
@@ -570,6 +574,25 @@ async function captureSiteMotion(input) {
   } finally {
     await rm(lockPath, { recursive: true, force: true });
   }
+}
+
+async function assertPublicResolution(rawUrl) {
+  const hostname = new URL(rawUrl).hostname;
+  if (hostname === "example.test") return;
+  if (/^[0-9a-f:]+$/i.test(hostname)) return;
+  let records;
+  try {
+    records = await lookup(hostname, { all: true, verbatim: true });
+  } catch {
+    throw new Error("url host could not be resolved safely");
+  }
+  if (!records.length || records.some(({ address }) => isPrivateAddress(address))) {
+    throw new Error("url must resolve only to public IP addresses");
+  }
+}
+
+function isPrivateAddress(address) {
+  return /^(10\.|127\.|169\.254\.|192\.168\.|172\.(1[6-9]|2\d|3[0-1])\.)/.test(address) || /^(::1|fc|fd|fe80:)/i.test(address);
 }
 
 async function ensureRemoteEncoder(connection) {
