@@ -160,6 +160,7 @@ async function collectJankReport(page, args, phases, consent) {
   const totalBlockingTimeMs = longTasks.reduce((sum, e) => sum + (e.duration - LONG_TASK_THRESHOLD_MS), 0);
   const choppy = totalBlockingTimeMs > args.jankThreshold;
   return {
+    schemaVersion: "motion-analysis.v2",
     consent,
     finalUrl: page.url(),
     longTaskCount: longTasks.length,
@@ -558,6 +559,8 @@ async function main() {
   }
 
   const phases = [];
+  const interactionFailures = [];
+  const scrollEvidence = { requested: args.scroll, completed: !args.scroll, requestedDistance: args.scrollDistance, completedDistance: 0, timedOut: false };
 
   console.error(`Navigating to ${args.url}`);
   await page.goto(args.url, { waitUntil: "load", timeout: 60_000 });
@@ -574,6 +577,7 @@ async function main() {
       await page.waitForTimeout(args.hoverWait);
     } catch (e) {
       console.error(`Hover target not found: ${sel} (${e.message})`);
+      interactionFailures.push({ kind: "hover", selector: sel, error: String(e.message || e) });
     }
   }
 
@@ -584,6 +588,7 @@ async function main() {
       await page.waitForTimeout(args.clickWait);
     } catch (e) {
       console.error(`Click target not found: ${sel} (${e.message})`);
+      interactionFailures.push({ kind: "click", selector: sel, error: String(e.message || e) });
     }
   }
   await markPhase(page, phases, "manual-interactions");
@@ -633,8 +638,10 @@ async function main() {
         await withTimeout(delayedCheck(page, "after-scroll-step", 100), scrollTimeout, "scroll reconciliation wait");
       } catch (error) {
         console.error(`scroll step ${i + 1}/${steps} timed out, stopping scroll (${error.message})`);
+        scrollEvidence.timedOut = true;
         break;
       }
+      scrollEvidence.completedDistance += args.scrollStep;
       const reconciledConsent = await runConsentBounded(page, args, "after-scroll-step");
       consent = combineConsentResults(args.consentMode, consent.recorded || recordedConsent, reconciledConsent);
     }
@@ -648,6 +655,11 @@ async function main() {
   const finalConsent = await runConsentBounded(page, args, "before-finalization");
   consent = combineConsentResults(args.consentMode, consent.recorded || recordedConsent, finalConsent);
   const jankReport = args.jankCheck ? await collectJankReport(page, args, phases, consent) : null;
+  if (jankReport) {
+    jankReport.interactionFailures = interactionFailures;
+    jankReport.scroll = scrollEvidence;
+    jankReport.status = interactionFailures.length || scrollEvidence.timedOut || consent?.blindSpots?.length ? "partial" : "valid";
+  }
 
   const video = page.video();
   await page.close();

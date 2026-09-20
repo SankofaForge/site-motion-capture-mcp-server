@@ -37,14 +37,14 @@ test("capture artifact contract includes reduced motion, validation, and persist
   }
 });
 
-test("media validation rejects empty files and reports unverified non-empty files", async () => {
+test("media validation rejects empty files and blocks unverified non-empty files", async () => {
   const dir = await mkdtemp(join(tmpdir(), "site-motion-media-"));
   const empty = join(dir, "empty.webm");
   const bytes = join(dir, "bytes.webm");
   await writeFile(empty, "");
   await writeFile(bytes, "fixture");
   assert.deepEqual(await validateMedia(empty), { status: "blocked", reason: "zero-byte WebM" });
-  assert.deepEqual(await validateMedia(bytes), { status: "unverified", reason: "ffprobe validation is required for complete status" });
+  assert.deepEqual(await validateMedia(bytes), { status: "blocked", reason: "ffprobe rejected the WebM" });
 });
 
 test("remote recorder declares reduced-motion and non-secret identity metadata", async () => {
