@@ -325,9 +325,10 @@ function validateCaptureInput(input) {
   if (!['http:', 'https:'].includes(url.protocol)) {
     throw new Error("url must use http:// or https://.");
   }
-  if (url.username || url.password || /(^|\.)localhost$/.test(url.hostname) || url.hostname.endsWith(".local") ||
-      /^(10\.|127\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[0-1])\.)/.test(url.hostname) ||
-      /^(::1|fc|fd|fe80:)/i.test(url.hostname)) {
+  const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (url.username || url.password || /(^|\.)localhost$/.test(hostname) || hostname.endsWith(".local") ||
+      /^(10\.|127\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[0-1])\.)/.test(hostname) ||
+      /^(::1|fc|fd|fe80:)/i.test(hostname)) {
     throw new Error("url must target a public HTTP(S) host without credentials.");
   }
 
