@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, rm, stat } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { resolve, join, basename } from "node:path";
 import { spawn } from "node:child_process";
@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 
 const SERVER_NAME = "site-motion-capture";
 const SERVER_VERSION = "1.0.0";
+const CONTRACT_VERSION = "1.1.0";
 const INSTANCE_ID = process.env.VAST_INSTANCE_ID || "48790763";
 const REMOTE_ROOT = process.env.SITE_MOTION_REMOTE_ROOT || "/workspace/site-motion-capture";
 const REMOTE_OUTPUT = process.env.SITE_MOTION_REMOTE_OUTPUT || `${REMOTE_ROOT}/out`;
@@ -69,6 +70,7 @@ const tools = [
         hover_selector: { type: "string", description: "A CSS selector to hover during the capture." },
         click_selector: { type: "string", description: "A CSS selector to click during the capture." },
         mobile: { type: "boolean", default: false },
+        reduced_motion: { type: "boolean", default: false, description: "Emulate prefers-reduced-motion during recording." },
         no_scroll: { type: "boolean", default: false },
         gpu: { type: "boolean", default: true },
         timeout_ms: { type: "integer", minimum: 30000, maximum: 600000, default: 180000 },
@@ -144,6 +146,36 @@ function run(command, args, { timeoutMs = 120000, env = process.env, killDelayMs
 function trimOutput(value) {
   const text = String(value).trim();
   return text.length > 4000 ? `${text.slice(-4000)}…` : text;
+}
+
+async function validateMedia(filePath) {
+  const info = await stat(filePath);
+  if (info.size === 0) return { status: "blocked", reason: "zero-byte WebM" };
+  if (process.env.SITE_MOTION_FFPROBE !== "true") return { status: "unverified", reason: "ffprobe validation is required for complete status" };
+  const probe = await run("ffprobe", ["-v", "error", "-show_entries", "format=format_name,duration", "-of", "json", filePath], { timeoutMs: 10000 });
+  if (probe.error && /ENOENT|not found/i.test(probe.error.message)) {
+    return { status: "blocked", reason: "ffprobe is unavailable" };
+  }
+  if (probe.error || !probe.stdout.trim()) return { status: "blocked", reason: "ffprobe rejected the WebM" };
+  try {
+    const format = JSON.parse(probe.stdout).format;
+    const duration = Number(format?.duration);
+    if (!format?.format_name || !Number.isFinite(duration) || duration <= 0) return { status: "blocked", reason: "ffprobe returned no positive duration" };
+    return { status: "valid", format: format.format_name, durationSeconds: duration };
+  } catch {
+    return { status: "blocked", reason: "ffprobe returned invalid JSON" };
+  }
+}
+
+function validateJankReport(jankReport) {
+  if (!jankReport || typeof jankReport !== "object") throw new Error("jank validation failed");
+  if (jankReport.longTaskCount !== undefined && (!Number.isInteger(jankReport.longTaskCount) || jankReport.longTaskCount < 0)) {
+    throw new Error("jank validation failed");
+  }
+  if (jankReport.longTasks !== undefined && !Array.isArray(jankReport.longTasks)) {
+    throw new Error("jank validation failed");
+  }
+  return jankReport;
 }
 
 async function resolveConnection() {
@@ -339,6 +371,7 @@ function validateCaptureInput(input) {
     consentWaitMs: integerOption(input, "consent_wait_ms", 1200, 0, 10000),
     consentPreflight: booleanOption(input, "consent_preflight", true),
     mobile: booleanOption(input, "mobile", false),
+    reducedMotion: booleanOption(input, "reduced_motion", false),
     noScroll: booleanOption(input, "no_scroll", false),
     gpu: booleanOption(input, "gpu", true),
     timeoutMs: integerOption(input, "timeout_ms", 180000, 30000, 600000),
@@ -351,6 +384,7 @@ async function captureSiteMotion(input) {
   const runId = randomUUID();
   const localVideo = join(capture.outputDir, `${capture.name}.webm`);
   const localJank = join(capture.outputDir, `${capture.name}.jank.json`);
+  const localManifest = join(capture.outputDir, `${capture.name}.manifest.json`);
   const lockPath = join(capture.outputDir, `.${capture.name}.capture.lock`);
   await mkdir(capture.outputDir, { recursive: true });
   try {
@@ -362,7 +396,7 @@ async function captureSiteMotion(input) {
   try {
     const connection = await resolveConnection();
     if (!capture.overwrite) {
-      for (const target of [localVideo, localJank]) {
+      for (const target of [localVideo, localJank, localManifest]) {
         try {
           await stat(target);
           throw new Error(`capture target exists: ${target}; set overwrite=true to replace it.`);
@@ -408,6 +442,7 @@ async function captureSiteMotion(input) {
   ];
   if (capture.gpu) remoteArgs.push("--gpu");
   if (capture.mobile) remoteArgs.push("--mobile");
+  if (capture.reducedMotion) remoteArgs.push("--reduced-motion");
   if (capture.noScroll) remoteArgs.push("--no-scroll");
   if (!capture.consentPreflight) remoteArgs.push("--no-consent-preflight");
   if (capture.consentSelector) remoteArgs.push("--consent-selector", capture.consentSelector);
@@ -439,10 +474,26 @@ async function captureSiteMotion(input) {
       const path = join(stageDir, file.path);
       const bytes = await readFile(path);
       const info = await stat(path);
-      if (info.size !== file.size || createHash("sha256").update(bytes).digest("hex") !== file.sha256) throw new Error(`manifest validation failed for ${file.path}`);
+      if (info.size === 0 || info.size !== file.size || createHash("sha256").update(bytes).digest("hex") !== file.sha256) throw new Error(`manifest validation failed for ${file.path}`);
     }
+    const jankReport = JSON.parse(await readFile(join(stageDir, `${capture.name}.jank.json`), "utf8"));
+    validateJankReport(jankReport);
+    const mediaValidation = await validateMedia(join(stageDir, `${capture.name}.webm`));
+    if (mediaValidation.status === "blocked") throw new Error(`media validation failed: ${mediaValidation.reason}`);
     await rename(join(stageDir, `${capture.name}.webm`), localVideo);
     await rename(join(stageDir, `${capture.name}.jank.json`), localJank);
+    const localManifestData = {
+      ...manifest,
+      contractVersion: CONTRACT_VERSION,
+      url: capture.url,
+      finalUrl: jankReport.finalUrl || capture.url,
+      viewport: { width: capture.width, height: capture.height, mobile: capture.mobile, reducedMotion: capture.reducedMotion },
+      modes: { gpu: capture.gpu, scroll: !capture.noScroll },
+      validation: { media: mediaValidation, jank: { status: "valid" } },
+      cleanup: "pending",
+      status: mediaValidation.status === "valid" ? "complete" : "partial",
+    };
+    await writeFile(localManifest, JSON.stringify(localManifestData, null, 2));
     await runRemote(connection, "rm", ["-rf", "--", remoteRunDir], 30000);
     cleanup = "confirmed";
   } catch (error) {
@@ -456,30 +507,36 @@ async function captureSiteMotion(input) {
     await rm(stageDir, { recursive: true, force: true });
   }
   const jankReport = JSON.parse(await readFile(localJank, "utf8"));
+  const manifest = JSON.parse(await readFile(localManifest, "utf8"));
+  manifest.cleanup = cleanup;
+  await writeFile(localManifest, JSON.stringify(manifest, null, 2));
+  const contract = {
+    contractVersion: CONTRACT_VERSION,
+    status: manifest.status,
+    runId,
+    url: capture.url,
+    finalUrl: manifest.finalUrl || capture.url,
+    viewport: manifest.viewport,
+    modes: manifest.modes,
+    worker: { instanceId: INSTANCE_ID, remoteRunDir, recorder: manifest.recorder || null },
+    consent: jankReport.consent || null,
+    artifacts: { video: { path: localVideo, size: manifest.files.find((f) => f.path.endsWith(".webm"))?.size, sha256: manifest.files.find((f) => f.path.endsWith(".webm"))?.sha256 }, jank: { path: localJank, size: manifest.files.find((f) => f.path.endsWith(".jank.json"))?.size, sha256: manifest.files.find((f) => f.path.endsWith(".jank.json"))?.sha256 }, manifest: { path: localManifest, size: (await stat(localManifest)).size } },
+    validation: manifest.validation,
+    cleanup,
+  };
 
   return {
     content: [
       {
         type: "text",
         text: JSON.stringify(
-          {
-            runId,
-            url: capture.url,
-            instanceId: INSTANCE_ID,
-            gpuCapture: capture.gpu,
-            remoteVideo,
-            remoteJank,
-            localVideoPath: localVideo,
-            localJankPath: localJank,
-            consent: jankReport.consent || null,
-            recorderOutput: trimOutput(remote.stdout),
-            cleanup,
-          },
+    { ...contract, remoteVideo, remoteJank, localVideoPath: localVideo, localJankPath: localJank, recorderOutput: trimOutput(remote.stdout) },
           null,
           2,
         ),
       },
     ],
+    structuredContent: { ...contract, localVideoPath: localVideo, localJankPath: localJank },
   };
   } finally {
     await rm(lockPath, { recursive: true, force: true });
@@ -621,6 +678,8 @@ export {
   shellQuote,
   isSafeRemoteRunDir,
   trimOutput,
+  validateMedia,
+  validateJankReport,
   tools,
   SERVER_NAME,
   SERVER_VERSION,
@@ -628,4 +687,5 @@ export {
   REMOTE_ROOT,
   REMOTE_OUTPUT,
   DEFAULT_LOCAL_OUTPUT,
+  CONTRACT_VERSION,
 };

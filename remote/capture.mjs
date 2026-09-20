@@ -1,14 +1,16 @@
-import { mkdir, rename, writeFile, stat } from "node:fs/promises";
+import { mkdir, rename, writeFile, stat, readFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import path from "node:path";
 
 let chromium;
 
 const LONG_TASK_THRESHOLD_MS = 50; // browser's own definition of a "long task"
+const RECORDER_VERSION = "1.1.0";
 
 function parseArgs(argv) {
   const args = {
     url: null, out: "./out", width: 1440, height: 900, mobile: false,
+    reducedMotion: false,
     settle: 1200, waitFonts: true, waitIdle: true, idleTimeout: 8000,
     scroll: true, scrollDistance: null, scrollStep: 100, scrollPause: 60,
     hoverSelectors: [], hoverWait: 800, clickSelectors: [], clickWait: 1200,
@@ -29,6 +31,7 @@ function parseArgs(argv) {
       case "--width": args.width = Number(next()); break;
       case "--height": args.height = Number(next()); break;
       case "--mobile": args.mobile = true; break;
+      case "--reduced-motion": args.reducedMotion = true; break;
       case "--consent-mode": args.consentMode = next(); break;
       case "--consent-accept-approved": args.consentAcceptApproved = next(); break;
       case "--consent_accept_approved": args.consentAcceptApproved = next(); break;
@@ -158,6 +161,7 @@ async function collectJankReport(page, args, phases, consent) {
   const choppy = totalBlockingTimeMs > args.jankThreshold;
   return {
     consent,
+    finalUrl: page.url(),
     longTaskCount: longTasks.length,
     totalBlockingTimeMs: Math.round(totalBlockingTimeMs),
     thresholdMs: args.jankThreshold,
@@ -433,7 +437,7 @@ function combineConsentResults(mode, preflight, recorded) {
   };
 }
 
-async function writeManifest(out, files, runId) {
+async function writeManifest(out, files, runId, metadata = {}) {
   const entries = [];
   for (const file of files) {
     const info = await stat(file);
@@ -442,7 +446,8 @@ async function writeManifest(out, files, runId) {
     hash.update(data);
     entries.push({ path: path.basename(file), size: info.size, sha256: hash.digest("hex") });
   }
-  const manifest = { runId: runId || `${Date.now()}-${process.pid}`, generatedAt: new Date().toISOString(), files: entries };
+  const source = await readFile(new URL(import.meta.url).protocol === "file:" ? new URL(import.meta.url) : path.join(process.cwd(), "remote/capture.mjs"));
+  const manifest = { contractVersion: "1.1.0", runId: runId || `${Date.now()}-${process.pid}`, generatedAt: new Date().toISOString(), recorder: { version: RECORDER_VERSION, sha256: createHash("sha256").update(source).digest("hex") }, ...metadata, files: entries };
   const manifestPath = path.join(out, "manifest.json");
   await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
   return manifestPath;
@@ -543,6 +548,7 @@ async function main() {
   }
   context = await browser.newContext({
     viewport: { width: args.width, height: args.height },
+    reducedMotion: args.reducedMotion ? "reduce" : "no-preference",
     recordVideo: { dir: args.out, size: { width: args.width, height: args.height } },
     ...(preflightState ? { storageState: preflightState } : {}),
   });
@@ -674,7 +680,7 @@ async function main() {
     }
   }
 
-  const manifestPath = await writeManifest(args.out, [finalPath, ...(jankReport ? [path.join(args.out, `${stem}.jank.json`)] : [])], args.runId);
+  const manifestPath = await writeManifest(args.out, [finalPath, ...(jankReport ? [path.join(args.out, `${stem}.jank.json`)] : [])], args.runId, { url: args.url, finalUrl: jankReport?.finalUrl || args.url, viewport: { width: args.width, height: args.height, mobile: args.mobile, reducedMotion: args.reducedMotion }, modes: { gpu: args.gpu, scroll: args.scroll } });
   console.error(`Manifest written to ${manifestPath}`);
 
   console.log(finalPath);

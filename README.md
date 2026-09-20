@@ -2,7 +2,8 @@
 
 This MCP server captures live website motion on the rented Vast.ai GPU VM. It
 uses the existing Playwright recorder on that VM and copies the WebM video and
-jank report to the local machine.
+jank report to the local machine. Each capture also leaves a persistent
+`<name>.manifest.json` contract record beside those two artifacts.
 
 Use `design-inspiration` to find candidate sites. Use this server after a site
 has been selected and its live behavior needs inspection.
@@ -19,7 +20,10 @@ planning.
 
 - `capture_site_motion` records page load, scroll, and optional hover or click
   behavior. Desktop captures default to 1920×1080. It returns local and remote
-  artifact paths. The MCP keeps Playwright's WebM encoder at an 8 Mbps target
+  artifact paths in both `content` and MCP `structuredContent`. The contract
+  includes URL/final URL, viewport and modes, worker and recorder metadata,
+  consent, artifact sizes and SHA-256 hashes, media/jank validation, cleanup,
+  and a `complete`, `partial`, or `blocked` status. The MCP keeps Playwright's WebM encoder at an 8 Mbps target
   so text and fine UI details remain readable. It rejects non-essential cookie
   consent by default and records the action in the jank report.
 - `check_capture_gpu` checks both `nvidia-smi` and the Chromium WebGL renderer.
@@ -65,13 +69,24 @@ interactions outside that pass. Automatic discovery is best-effort and does
 not prove that every interaction was captured.
 
 The local `name` is a stable file stem for the copied `.webm` and `.jank.json`
-files. It is not the remote run ID. Keep the local name stable when comparing
+files. The matching `<name>.manifest.json` is retained after staging cleanup.
+It is not the remote run ID. Keep the local name stable when comparing
 runs. Use the remote run ID for remote logs and cleanup. Unless `output_dir` or
 `SITE_MOTION_OUTPUT_DIR` is supplied, local artifacts are saved under
 `artifacts/design-inspiration/site-motion-capture/` in the MCP client's current
 workspace. Use `overwrite: false` when available so an existing local capture
 is preserved. Cleanup reports one status per artifact: `removed`, `missing`,
-`skipped`, or `failed`. A cleanup failure does not mean that the capture failed.
+`skipped`, or `failed`. A cleanup failure does not erase the staged artifacts or
+the manifest. Set `reduced_motion: true` to propagate Playwright's
+`prefers-reduced-motion: reduce` emulation to the recorded context.
+
+Transfer integrity requires non-zero files and matching size/SHA-256 values.
+The jank report must have the expected structured fields. If `ffprobe` is
+available in the existing runtime it must accept the WebM; otherwise media
+validation is explicitly `unverified` and the overall status is `partial`.
+The launcher only invokes it when `SITE_MOTION_FFPROBE=true` declares that
+runtime capability.
+An available `ffprobe` that rejects the file produces `blocked`.
 
 ## Runtime
 
