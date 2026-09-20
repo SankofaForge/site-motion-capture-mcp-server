@@ -329,6 +329,7 @@ test("validateCaptureInput() default name and all parameter validations", () => 
 test("captureSiteMotion() file exist / lock error / manifest edge cases", async () => {
   const bin = await shimBin();
   const out = await tempDir("edge-capture-");
+  await writeExecutable(bin, "ffprobe", `process.stdout.write(JSON.stringify({ format: { format_name: "matroska,webm", duration: "1.0" } }));`);
   const prevPath = process.env.PATH;
   const prevUrl = process.env.SITE_MOTION_SSH_URL;
   process.env.PATH = `${bin}:${process.env.PATH}`;

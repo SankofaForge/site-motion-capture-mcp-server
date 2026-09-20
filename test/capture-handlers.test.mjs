@@ -321,6 +321,7 @@ test("lock conflict reports capture_target_busy", async () => {
 test("validates manifest and output transfer with correct sha256 checksums", async () => {
   const bin = await shimBin();
   const out = await tempDir("manifest-test-");
+  await writeExecutable(bin, "ffprobe", `process.stdout.write(JSON.stringify({ format: { format_name: "matroska,webm", duration: "1.0" } }));`);
   const videoBytes = Buffer.from("fake-webm-video-data");
   const jankBytes = Buffer.from(JSON.stringify({ consent: { action: "rejected" }, longTaskCount: 0 }));
 

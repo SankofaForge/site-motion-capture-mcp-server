@@ -2,8 +2,8 @@
 
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { resolve, join, basename } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { resolve, join, basename, relative, isAbsolute } from "node:path";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
@@ -17,6 +17,8 @@ const REMOTE_OUTPUT = process.env.SITE_MOTION_REMOTE_OUTPUT || `${REMOTE_ROOT}/o
 const DEFAULT_LOCAL_OUTPUT =
   process.env.SITE_MOTION_OUTPUT_DIR ||
   join(process.cwd(), "artifacts", "design-inspiration", "site-motion-capture");
+const GPU_CHECK_TTL_MS = 120_000;
+const gpuChecks = new Map();
 
 const tools = [
   {
@@ -73,6 +75,7 @@ const tools = [
         reduced_motion: { type: "boolean", default: false, description: "Emulate prefers-reduced-motion during recording." },
         no_scroll: { type: "boolean", default: false },
         gpu: { type: "boolean", default: true },
+        gpu_check_id: { type: "string", description: "Short-lived ID returned by check_capture_gpu." },
         timeout_ms: { type: "integer", minimum: 30000, maximum: 600000, default: 180000 },
         overwrite: { type: "boolean", default: false },
       },
@@ -151,7 +154,7 @@ function trimOutput(value) {
 async function validateMedia(filePath) {
   const info = await stat(filePath);
   if (info.size === 0) return { status: "blocked", reason: "zero-byte WebM" };
-  if (process.env.SITE_MOTION_FFPROBE !== "true") return { status: "unverified", reason: "ffprobe validation is required for complete status" };
+  // SITE_MOTION_FFPROBE is intentionally ignored: complete evidence always requires validation.
   const probe = await run("ffprobe", ["-v", "error", "-show_entries", "format=format_name,duration", "-of", "json", filePath], { timeoutMs: 10000 });
   if (probe.error && /ENOENT|not found/i.test(probe.error.message)) {
     return { status: "blocked", reason: "ffprobe is unavailable" };
@@ -322,12 +325,24 @@ function validateCaptureInput(input) {
   if (!['http:', 'https:'].includes(url.protocol)) {
     throw new Error("url must use http:// or https://.");
   }
+  if (url.username || url.password || /(^|\.)localhost$/.test(url.hostname) || url.hostname.endsWith(".local") ||
+      /^(10\.|127\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[0-1])\.)/.test(url.hostname) ||
+      /^(::1|fc|fd|fe80:)/i.test(url.hostname)) {
+    throw new Error("url must target a public HTTP(S) host without credentials.");
+  }
 
   const name = input.name ?? `capture-${Date.now()}`;
   if (typeof name !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$/.test(name)) {
     throw new Error("name must contain 1 to 81 letters, numbers, dots, dashes, or underscores.");
   }
   const outputDir = resolve(input.output_dir || DEFAULT_LOCAL_OUTPUT);
+  const approvedRoots = [resolve(process.env.SITE_MOTION_APPROVED_OUTPUT_ROOT || process.cwd()), resolve(tmpdir())];
+  if (!approvedRoots.some((approvedRoot) => {
+    const outputRelative = relative(approvedRoot, outputDir);
+    return !isAbsolute(outputRelative) && !outputRelative.startsWith("..");
+  })) {
+    throw new Error("output_dir must remain inside the approved workspace output root.");
+  }
   const hoverSelector = validateString(input.hover_selector, "hover_selector", { maxLength: 300 });
   const clickSelector = validateString(input.click_selector, "click_selector", { maxLength: 300 });
   const consentSelector = validateString(input.consent_selector, "consent_selector", { maxLength: 300 });
@@ -374,6 +389,7 @@ function validateCaptureInput(input) {
     reducedMotion: booleanOption(input, "reduced_motion", false),
     noScroll: booleanOption(input, "no_scroll", false),
     gpu: booleanOption(input, "gpu", true),
+    gpuCheckId: validateString(input.gpu_check_id, "gpu_check_id", { maxLength: 80 }),
     timeoutMs: integerOption(input, "timeout_ms", 180000, 30000, 600000),
     overwrite: booleanOption(input, "overwrite", false),
   };
@@ -381,6 +397,12 @@ function validateCaptureInput(input) {
 
 async function captureSiteMotion(input) {
   const capture = validateCaptureInput(input);
+  let gpuCheckFailure = null;
+  if (capture.gpu) {
+    const check = capture.gpuCheckId ? gpuChecks.get(capture.gpuCheckId) : undefined;
+    if (!check || check.expiresAt < Date.now()) gpuCheckFailure = "gpu_check_id is required and must be a fresh GPU check";
+    else gpuChecks.delete(capture.gpuCheckId);
+  }
   const runId = randomUUID();
   const localVideo = join(capture.outputDir, `${capture.name}.webm`);
   const localJank = join(capture.outputDir, `${capture.name}.jank.json`);
@@ -487,11 +509,17 @@ async function captureSiteMotion(input) {
       contractVersion: CONTRACT_VERSION,
       url: capture.url,
       finalUrl: jankReport.finalUrl || capture.url,
-      viewport: { width: capture.width, height: capture.height, mobile: capture.mobile, reducedMotion: capture.reducedMotion },
+      viewport: manifest.viewport || { width: capture.width, height: capture.height, mobile: capture.mobile, reducedMotion: capture.reducedMotion },
       modes: { gpu: capture.gpu, scroll: !capture.noScroll },
       validation: { media: mediaValidation, jank: { status: "valid" } },
       cleanup: "pending",
-      status: mediaValidation.status === "valid" ? "complete" : "partial",
+      status: mediaValidation.status === "valid" && jankReport.status === "valid" && cleanup === "pending" && !gpuCheckFailure ? "complete" : "partial",
+      evidence: {
+        gpu: gpuCheckFailure ? { status: "blocked", reason: gpuCheckFailure } : { status: "verified" },
+        consent: jankReport.consent || null,
+        interactionFailures: jankReport.interactionFailures || [],
+        scroll: jankReport.scroll || null,
+      },
     };
     await writeFile(localManifest, JSON.stringify(localManifestData, null, 2));
     await runRemote(connection, "rm", ["-rf", "--", remoteRunDir], 30000);
@@ -568,12 +596,16 @@ async function checkCaptureGpu() {
     30000,
   );
   const renderer = await runRemote(connection, "node", [`${REMOTE_ROOT}/check-gpu-renderer.mjs`], 60000);
+  const checkId = randomUUID();
+  gpuChecks.set(checkId, { expiresAt: Date.now() + GPU_CHECK_TTL_MS });
   return {
     content: [
       {
         type: "text",
         text: JSON.stringify(
           {
+            checkId,
+            expiresAt: new Date(Date.now() + GPU_CHECK_TTL_MS).toISOString(),
             instanceId: INSTANCE_ID,
             gpu: gpu.stdout.trim(),
             chromiumWebgl: trimOutput(renderer.stdout),
