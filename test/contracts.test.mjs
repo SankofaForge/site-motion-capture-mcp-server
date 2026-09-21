@@ -44,7 +44,10 @@ test("media validation rejects empty files and blocks unverified non-empty files
   await writeFile(empty, "");
   await writeFile(bytes, "fixture");
   assert.deepEqual(await validateMedia(empty), { status: "blocked", reason: "zero-byte WebM" });
-  assert.deepEqual(await validateMedia(bytes), { status: "blocked", reason: "ffprobe rejected the WebM" });
+  assert.deepEqual(
+    await withFfprobe("", () => validateMedia(bytes)),
+    { status: "blocked", reason: "ffprobe rejected the WebM" },
+  );
 });
 
 test("remote recorder declares reduced-motion and non-secret identity metadata", async () => {

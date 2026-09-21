@@ -533,7 +533,7 @@ async function captureSiteMotion(input) {
     const cleanupResult = await Promise.allSettled([
       runRemote(connection, "rm", ["-rf", "--", remoteRunDir], 30000),
     ]);
-    cleanup = cleanupResult[0].status === "fulfilled" ? "confirmed" : "pending";
+    cleanup = { fulfilled: "confirmed", rejected: "pending" }[cleanupResult[0].status];
     throw error;
   } finally {
     await rm(stageDir, { recursive: true, force: true });
