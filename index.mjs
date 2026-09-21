@@ -577,7 +577,7 @@ async function captureSiteMotion(input) {
 }
 
 async function assertPublicResolution(rawUrl) {
-  const hostname = new URL(rawUrl).hostname;
+  const hostname = new URL(rawUrl).hostname.replace(/^\[|\]$/g, "");
   if (hostname === "example.test") return;
   if (/^[0-9a-f:]+$/i.test(hostname)) return;
   let records;
@@ -736,6 +736,8 @@ export {
   trimOutput,
   validateMedia,
   validateJankReport,
+  assertPublicResolution,
+  isPrivateAddress,
   tools,
   SERVER_NAME,
   SERVER_VERSION,

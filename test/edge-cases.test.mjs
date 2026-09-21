@@ -15,6 +15,8 @@ import {
   integerOption,
   booleanOption,
   validateCaptureInput,
+  assertPublicResolution,
+  isPrivateAddress,
   captureSiteMotion,
   ensureRemoteEncoder,
   checkCaptureGpu,
@@ -100,6 +102,21 @@ test("trimOutput() trims and truncates strings exceeding 4000 chars", () => {
   const trimmed = trimOutput(longText);
   assert.equal(trimmed.length, 4001); // 4000 slice + '…'
   assert.ok(trimmed.endsWith("…"));
+});
+
+test("public-resolution guards cover literal and DNS safety paths", async () => {
+  assert.equal(isPrivateAddress("127.0.0.1"), true);
+  assert.equal(isPrivateAddress("::1"), true);
+  assert.equal(isPrivateAddress("203.0.113.10"), false);
+  await assert.doesNotReject(() => assertPublicResolution("https://[::1]/"));
+  await assert.rejects(
+    () => assertPublicResolution("https://localhost/"),
+    /url must resolve only to public IP addresses/
+  );
+  await assert.rejects(
+    () => assertPublicResolution("https://does-not-exist.invalid/"),
+    /url host could not be resolved safely/
+  );
 });
 
 test("shellQuote() escapes single quotes properly", () => {
@@ -652,12 +669,15 @@ if (dest.endsWith("manifest.json")) {
     assert.equal(parsedReport.cleanup, "confirmed");
 
     // Successful capture covering mobile, no-scroll, selectors, and consent accept approved
+    const gpuCheck = await checkCaptureGpu();
+    const gpuCheckId = JSON.parse(gpuCheck.content[0].text).checkId;
     const resultFullOptions = await captureSiteMotion({
       url: "https://example.test",
       name: "no-consent",
       output_dir: out,
       overwrite: true,
       gpu: true,
+      gpu_check_id: gpuCheckId,
       mobile: true,
       no_scroll: true,
       consent_preflight: true,
