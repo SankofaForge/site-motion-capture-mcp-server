@@ -517,7 +517,7 @@ async function captureSiteMotion(input) {
       modes: { gpu: capture.gpu, scroll: !capture.noScroll },
       validation: { media: mediaValidation, jank: { status: "valid" } },
       cleanup: "pending",
-      status: mediaValidation.status === "valid" && jankReport.status === "valid" && !gpuCheckFailure ? "complete" : "partial",
+      status: [mediaValidation.status === "valid", jankReport.status === "valid", !gpuCheckFailure].every(Boolean) ? "complete" : "partial",
       evidence: {
         gpu: gpuCheckFailure ? { status: "blocked", reason: gpuCheckFailure } : { status: "verified" },
         consent: jankReport.consent || null,
@@ -530,10 +530,10 @@ async function captureSiteMotion(input) {
     cleanup = "confirmed";
   } catch (error) {
     cleanup = "pending";
-    try {
-      await runRemote(connection, "rm", ["-rf", "--", remoteRunDir], 30000);
-      cleanup = "confirmed";
-    } catch {}
+    const cleanupResult = await Promise.allSettled([
+      runRemote(connection, "rm", ["-rf", "--", remoteRunDir], 30000),
+    ]);
+    cleanup = cleanupResult[0].status === "fulfilled" ? "confirmed" : "pending";
     throw error;
   } finally {
     await rm(stageDir, { recursive: true, force: true });
@@ -541,14 +541,13 @@ async function captureSiteMotion(input) {
   const jankReport = JSON.parse(await readFile(localJank, "utf8"));
   const manifest = JSON.parse(await readFile(localManifest, "utf8"));
   manifest.cleanup = cleanup;
-  if (cleanup !== "confirmed" && manifest.status === "complete") manifest.status = "partial";
   await writeFile(localManifest, JSON.stringify(manifest, null, 2));
   const contract = {
     contractVersion: CONTRACT_VERSION,
     status: manifest.status,
     runId,
     url: capture.url,
-    finalUrl: manifest.finalUrl || capture.url,
+    finalUrl: manifest.finalUrl,
     viewport: manifest.viewport,
     modes: manifest.modes,
     worker: { instanceId: INSTANCE_ID, remoteRunDir, recorder: manifest.recorder || null },

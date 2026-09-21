@@ -108,6 +108,20 @@ test("public-resolution guards cover literal and DNS safety paths", async () => 
   assert.equal(isPrivateAddress("127.0.0.1"), true);
   assert.equal(isPrivateAddress("::1"), true);
   assert.equal(isPrivateAddress("203.0.113.10"), false);
+  for (const address of [
+    "10.0.0.1",
+    "169.254.1.1",
+    "192.168.1.1",
+    "172.16.0.1",
+    "172.31.255.254",
+    "fc00::1",
+    "fd12::1",
+    "fe80::1",
+  ]) {
+    assert.equal(isPrivateAddress(address), true, address);
+  }
+  assert.equal(isPrivateAddress("172.15.0.1"), false);
+  assert.equal(isPrivateAddress("2001:db8::1"), false);
   await assert.doesNotReject(() => assertPublicResolution("https://[::1]/"));
   await assert.rejects(
     () => assertPublicResolution("https://localhost/"),
@@ -628,7 +642,7 @@ if (dest.endsWith("manifest.json")) {
 
     // Successful capture with absent consent in jank report -> defaults to consent: null
     const videoData = Buffer.from("video-bytes");
-    const jankStr = JSON.stringify({ noConsentField: true });
+    const jankStr = JSON.stringify({ noConsentField: true, status: "valid" });
     const jankData = Buffer.from(jankStr);
     await writeExecutable(
       bin,
@@ -691,6 +705,82 @@ if (dest.endsWith("manifest.json")) {
     });
     const parsedFullReport = JSON.parse(resultFullOptions.content[0].text);
     assert.equal(parsedFullReport.cleanup, "confirmed");
+
+    const gpuStatusReport = await captureSiteMotion({
+      url: "https://example.test",
+      name: "no-consent",
+      output_dir: out,
+      overwrite: true,
+      gpu: true,
+      gpu_check_id: "stale-gpu-check",
+    });
+    assert.equal(JSON.parse(gpuStatusReport.content[0].text).status, "partial");
+
+    // A valid capture can still be partial when the recorder reports degraded status.
+    const partialJank = JSON.stringify({ status: "partial", finalUrl: "https://final.example", interactionFailures: [] });
+    await writeExecutable(
+      bin,
+      "scp",
+      `
+const fs = require("node:fs");
+const crypto = require("node:crypto");
+const dest = process.argv.at(-1);
+const stageDir = require("node:path").dirname(dest);
+const runId = stageDir.replace(/^.*\\.capture-/, "");
+if (dest.endsWith("manifest.json")) {
+  const video = Buffer.from("partial-video");
+  const jank = Buffer.from(${JSON.stringify(partialJank)});
+  fs.writeFileSync(dest, JSON.stringify({ runId, files: [
+    { path: "partial.webm", size: video.length, sha256: crypto.createHash("sha256").update(video).digest("hex") },
+    { path: "partial.jank.json", size: jank.length, sha256: crypto.createHash("sha256").update(jank).digest("hex") },
+  ] }));
+} else if (dest.endsWith(".webm")) {
+  fs.writeFileSync(dest, "partial-video");
+} else {
+  fs.writeFileSync(dest, ${JSON.stringify(partialJank)});
+}
+`
+    );
+    const partialResult = await captureSiteMotion({
+      url: "https://example.test",
+      name: "partial",
+      output_dir: out,
+      overwrite: true,
+    });
+    const partialReport = JSON.parse(partialResult.content[0].text);
+    assert.equal(partialReport.status, "partial");
+    assert.equal(partialReport.finalUrl, "https://final.example");
+    assert.deepEqual(partialReport.viewport, { width: 1920, height: 1080, mobile: false, reducedMotion: false });
+
+    const blockedGpuResult = await captureSiteMotion({
+      url: "https://example.test",
+      name: "partial",
+      output_dir: out,
+      overwrite: true,
+      gpu: true,
+      gpu_check_id: "stale-gpu-check",
+      reduced_motion: true,
+    });
+    assert.equal(JSON.parse(blockedGpuResult.content[0].text).status, "partial");
+
+    // A transferred but unverified video is rejected before local promotion.
+    await writeExecutable(bin, "ffprobe", "process.exit(1);");
+    await assert.rejects(
+      async () => captureSiteMotion({ url: "https://example.test", name: "partial", output_dir: out, overwrite: true }),
+      /media validation failed/
+    );
+
+    // A transfer failure followed by a cleanup failure preserves the original error.
+    await writeExecutable(bin, "ssh", `
+const arg = process.argv.join(" ");
+if (arg.includes("rm -rf")) process.exit(1);
+process.stdout.write("ok\\n");
+`);
+    await writeExecutable(bin, "scp", "process.exit(1);");
+    await assert.rejects(
+      async () => captureSiteMotion({ url: "https://example.test", name: "transfer-failure", output_dir: out, overwrite: true }),
+      /exited with code 1/
+    );
 
     // Capture failure when remote rm cleanup in catch block fails -> cleanup stays pending
     await writeExecutable(
