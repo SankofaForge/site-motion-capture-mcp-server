@@ -1079,7 +1079,7 @@ process.stdout.write("worker ready\\n");
 
     await writeExecutable(bin, "ssh", `
 const arg = process.argv.join(" ");
-if (arg.includes("check-gpu-renderer.mjs")) process.exit(1);
+if (arg.includes("'node' '") && arg.includes("/check-gpu-renderer.mjs'")) process.exit(1);
 if (arg.includes("nvidia-smi")) process.stdout.write("NVIDIA RTX fixture\\n");
 else process.stdout.write("worker ready\\n");
 `);
