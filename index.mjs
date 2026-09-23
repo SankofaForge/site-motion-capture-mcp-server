@@ -760,7 +760,6 @@ async function captureSiteMotionWithController(input, controller) {
     let remote;
     let cleanup = "pending";
     let cleanupError = null;
-    let localManifestWritten = false;
     try {
       remote = await runRemoteCommand(connection, remoteCommand, capture.timeoutMs, remoteRunDir, controller.signal);
       await mkdir(stageDir, { recursive: true });
@@ -804,7 +803,6 @@ async function captureSiteMotionWithController(input, controller) {
         },
       };
       await writeFile(localManifest, JSON.stringify(localManifestData, null, 2));
-      localManifestWritten = true;
       try {
         await runRemote(connection, "rm", ["-rf", "--", remoteRunDir], 30000, controller.signal);
         cleanup = "confirmed";
@@ -813,13 +811,10 @@ async function captureSiteMotionWithController(input, controller) {
         cleanup = "pending";
       }
     } catch (error) {
-      cleanup = "pending";
-      const cleanupResult = await Promise.allSettled([
+      await Promise.allSettled([
         runRemote(connection, "rm", ["-rf", "--", remoteRunDir], 30000),
       ]);
-      cleanup = { fulfilled: "confirmed", rejected: "pending" }[cleanupResult[0].status];
-      if (!localManifestWritten) throw error;
-      cleanupError = cleanupError || (error instanceof Error ? error.message : String(error));
+      throw error;
     } finally {
       await rm(stageDir, { recursive: true, force: true });
     }
