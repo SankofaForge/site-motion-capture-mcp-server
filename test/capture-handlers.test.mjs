@@ -26,7 +26,12 @@ function server(messages, env = {}) {
         reject(new Error(`exit ${code}: ${output}`));
       }
     });
-    const input = messages.map((m) => (typeof m === "string" ? m : JSON.stringify(m))).join("\n") + "\n";
+    const input = messages.map((m) => {
+      if (typeof m === "string") return m;
+      const params = m?.params;
+      if (params?.name !== "capture_site_motion" || !params.arguments || typeof params.arguments !== "object" || params.arguments.gpu !== undefined) return JSON.stringify(m);
+      return JSON.stringify({ ...m, params: { ...params, arguments: { gpu: false, ...params.arguments } } });
+    }).join("\n") + "\n";
     child.stdin.end(input);
   });
 }
@@ -55,9 +60,7 @@ if (arg.includes("nvidia-smi")) {
     ],
     {
       PATH: `${bin}:${process.env.PATH}`,
-      SITE_MOTION_SSH_HOST: "gpu.fixture.test",
-      SITE_MOTION_SSH_PORT: "22022",
-      SITE_MOTION_SSH_USER: "customuser",
+      SITE_MOTION_SSH_URL: "ssh://customuser@gpu.fixture.test:22022",
     }
   );
 
@@ -246,6 +249,7 @@ test("SSH connection endpoint parsing and resolution", async () => {
     ],
     { SITE_MOTION_SSH_URL: "invalid-url" }
   );
+  assert.equal(replies[0].result.structuredContent.reasonCode, "capture-worker-malformed-url");
   assert.match(replies[0].result.content[0].text, /not a valid ssh:\/\/ URL/);
 
   // Non-SSH protocol URL
@@ -260,6 +264,7 @@ test("SSH connection endpoint parsing and resolution", async () => {
     ],
     { SITE_MOTION_SSH_URL: "https://example.com:22" }
   );
+  assert.equal(replies[0].result.structuredContent.reasonCode, "capture-worker-malformed-url");
   assert.match(replies[0].result.content[0].text, /must use ssh:\/\/user@host:port/);
 
   // Vast CLI resolution failure
@@ -283,7 +288,7 @@ if (process.argv.includes("fail")) {
     ],
     { PATH: `${bin}:${process.env.PATH}`, VAST_INSTANCE_ID: "fail" }
   );
-  assert.match(replies[0].result.content[0].text, /Could not resolve the Vast SSH endpoint/);
+  assert.equal(replies[0].result.structuredContent.reasonCode, "capture-worker-unavailable");
 
   replies = await server(
     [
@@ -294,9 +299,20 @@ if (process.argv.includes("fail")) {
         params: { name: "check_capture_gpu", arguments: {} },
       },
     ],
-    { PATH: `${bin}:${process.env.PATH}`, VAST_INSTANCE_ID: "48790763" }
+    { PATH: `${bin}:${process.env.PATH}`, VAST_INSTANCE_ID: "stale-instance" }
   );
-  assert.match(replies[0].result.content[0].text, /Vast CLI did not return an SSH endpoint/);
+  assert.equal(replies[0].result.structuredContent.reasonCode, "capture-worker-unavailable");
+  assert.equal(replies[0].result.isError, true);
+});
+
+test("worker configuration is required and has structured blocked errors", async () => {
+  const replies = await server([
+    { jsonrpc: "2.0", id: 305, method: "tools/call", params: { name: "check_capture_gpu", arguments: {} } },
+  ], { SITE_MOTION_SSH_URL: "", VAST_INSTANCE_ID: "" });
+  assert.equal(replies[0].result.isError, true);
+  assert.equal(replies[0].result.structuredContent.status, "blocked");
+  assert.equal(replies[0].result.structuredContent.reasonCode, "capture-worker-unconfigured");
+  assert.doesNotMatch(replies[0].result.content[0].text, /48790763/);
 });
 
 test("lock conflict reports capture_target_busy", async () => {

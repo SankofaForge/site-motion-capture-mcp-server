@@ -1,6 +1,8 @@
 import { mkdir, rename, writeFile, stat, readFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import path from "node:path";
+import { lookup } from "node:dns/promises";
+import { isIP } from "node:net";
 
 let chromium;
 
@@ -14,7 +16,7 @@ function parseArgs(argv) {
     settle: 1200, waitFonts: true, waitIdle: true, idleTimeout: 8000,
     scroll: true, scrollDistance: null, scrollStep: 100, scrollPause: 60,
     hoverSelectors: [], hoverWait: 800, clickSelectors: [], clickWait: 1200,
-    autoDiscover: false, autoDiscoverMax: 12, autoDiscoverWait: 700,
+    autoDiscover: false, autoDiscoverMax: 12, autoDiscoverWait: 700, expectedAddresses: [],
     tail: 1000, name: null,
     consentMode: "reject", consentAcceptApproved: false, consentSelectors: [], consentSettingsSelectors: [], consentOptionalSelectors: [], consentSaveSelectors: [], consentWait: 1200,
     consentBudgetMs: 8000, consentMaxClicks: 6, consentPreflight: true, runId: null,
@@ -57,6 +59,7 @@ function parseArgs(argv) {
       case "--click-selector": args.clickSelectors.push(next()); break;
       case "--click-wait": args.clickWait = Number(next()); break;
       case "--auto-discover": args.autoDiscover = true; break;
+      case "--expected-addresses": args.expectedAddresses = JSON.parse(next()); break;
       case "--auto-discover-max": args.autoDiscoverMax = Number(next()); break;
       case "--auto-discover-wait": args.autoDiscoverWait = Number(next()); break;
       case "--tail": args.tail = Number(next()); break;
@@ -105,6 +108,58 @@ function parseArgs(argv) {
   args.consentMaxClicks = Math.max(1, Math.min(12, Number.isInteger(args.consentMaxClicks) ? args.consentMaxClicks : 6));
   if (args.consentMode === "granular" && (!args.consentSettingsSelectors.length || !args.consentOptionalSelectors.length || !args.consentSaveSelectors.length)) throw new Error("granular consent requires settings, optional, and save selectors");
   return args;
+}
+
+function ipv6ToBigInt(address) {
+  const [head, tail] = address.split("::");
+  const left = head ? head.split(":").filter(Boolean) : [];
+  const right = tail ? tail.split(":").filter(Boolean) : [];
+  const groups = [...left, ...Array(8 - left.length - right.length).fill("0"), ...right];
+  return groups.reduce((value, group) => (value << 16n) + BigInt(parseInt(group || "0", 16)), 0n);
+}
+
+function isPrivateAddress(address) {
+  const normalized = String(address).toLowerCase().replace(/^\[|\]$/g, "");
+  if (normalized.startsWith("::ffff:")) return isPrivateAddress(normalized.slice(7));
+  if (isIP(normalized) === 4) {
+    const [a, b, c] = normalized.split(".").map(Number);
+    return a === 0 || a === 10 || a === 127 || (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 0 && c === 0) || (a === 192 && b === 0 && c === 2) || (a === 192 && b === 88 && c === 99) || (a === 192 && b === 168) || (a === 198 && b >= 18 && b <= 19) || a >= 224;
+  }
+  if (isIP(normalized) !== 6) return false;
+  const value = ipv6ToBigInt(normalized);
+  return [["::", 128], ["::1", 128], ["::ffff:0:0", 96], ["100::", 64], ["2001:db8::", 32], ["2001:10::", 28], ["fc00::", 7], ["fe80::", 10], ["ff00::", 8], ["2001:2::", 48]].some(([base, bits]) => {
+    const mask = ((1n << BigInt(bits)) - 1n) << BigInt(128 - bits);
+    return (value & mask) === (ipv6ToBigInt(base) & mask);
+  });
+}
+
+async function assertRemotePublicResolution(rawUrl, expectedAddresses) {
+  const hostname = new URL(rawUrl).hostname.replace(/^\[|\]$/g, "");
+  let addresses;
+  if (isIP(hostname)) addresses = [hostname];
+  else addresses = (await lookup(hostname, { all: true, verbatim: true })).map(({ address }) => address);
+  if (!addresses.length || addresses.some(isPrivateAddress)) throw new Error("remote URL resolution is not public");
+  const expected = [...expectedAddresses].filter((address) => isIP(address)).sort();
+  if (expected.length && JSON.stringify(addresses.sort()) !== JSON.stringify(expected)) throw new Error("remote URL resolution changed between bridge and worker");
+}
+
+async function installPublicRequestGuard(context, initialUrl, expectedAddresses) {
+  const initialHostname = new URL(initialUrl).hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  await context.route("**/*", async (route) => {
+    const requestUrl = route.request().url();
+    if (!/^https?:\/\//i.test(requestUrl)) {
+      await route.continue();
+      return;
+    }
+    try {
+      const hostname = new URL(requestUrl).hostname.toLowerCase().replace(/^\[|\]$/g, "");
+      await assertRemotePublicResolution(requestUrl, hostname === initialHostname ? expectedAddresses : []);
+    } catch {
+      await route.abort("blockedbyclient");
+      return;
+    }
+    await route.continue();
+  });
 }
 
 // Registers a PerformanceObserver on every new document (including the
@@ -493,24 +548,30 @@ async function autoDiscoverAndInteract(page, args) {
   const limit = Math.min(count, args.autoDiscoverMax);
   console.error(`auto-discover: found ${count} candidate(s), interacting with up to ${limit}`);
 
+  const interactions = [];
   for (let i = 0; i < limit; i++) {
     const el = page.locator(selector).nth(i);
     try {
-      if (!(await el.isVisible())) continue;
+      if (!(await el.isVisible())) { interactions.push({ index: i, status: "skipped", reason: "not-visible" }); continue; }
       await el.scrollIntoViewIfNeeded({ timeout: 2000 });
       await hoverThenForce(el, 800);
       await page.waitForTimeout(args.autoDiscoverWait / 2);
-      await clickThenForce(el, 800).catch(() => {});
+      let clickStatus = "clicked";
+      await clickThenForce(el, 800).catch((error) => { clickStatus = "failed"; interactions.push({ index: i, status: clickStatus, error: String(error.message || error) }); });
       await page.waitForTimeout(args.autoDiscoverWait);
+      if (clickStatus === "clicked") interactions.push({ index: i, status: clickStatus });
     } catch (e) {
       console.error(`auto-discover: skipped element ${i} (${e.message})`);
+      interactions.push({ index: i, status: "failed", error: String(e.message || e) });
     }
   }
+  return interactions;
 }
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.selfTest) return runConsentSelfTest();
+  await assertRemotePublicResolution(args.url, args.expectedAddresses);
   ({ chromium } = await import("playwright"));
   await mkdir(args.out, { recursive: true });
 
@@ -543,6 +604,7 @@ async function main() {
     preflightContext = await browser.newContext({
       viewport: { width: args.width, height: args.height },
     });
+    await installPublicRequestGuard(preflightContext, args.url, args.expectedAddresses);
     const preflightPage = await preflightContext.newPage();
     await preflightPage.goto(args.url, { waitUntil: "load", timeout: 60_000 });
     preflightConsent = await runConsentBounded(preflightPage, args, "preflight");
@@ -555,6 +617,7 @@ async function main() {
     recordVideo: { dir: args.out, size: { width: args.width, height: args.height } },
     ...(preflightState ? { storageState: preflightState } : {}),
   });
+  await installPublicRequestGuard(context, args.url, args.expectedAddresses);
   page = await context.newPage();
   if (args.jankCheck) {
     await installJankObserver(page);
@@ -562,7 +625,8 @@ async function main() {
 
   const phases = [];
   const interactionFailures = [];
-  const scrollEvidence = { requested: args.scroll, completed: !args.scroll, requestedDistance: args.scrollDistance, completedDistance: 0, timedOut: false };
+  const interactions = [];
+  const scrollEvidence = { requested: args.scroll, completed: !args.scroll, requestedDistance: args.scrollDistance, measuredDistance: null, completedDistance: 0, actualDistance: 0, timedOut: false, truncated: false };
 
   console.error(`Navigating to ${args.url}`);
   await page.goto(args.url, { waitUntil: "load", timeout: 60_000 });
@@ -596,7 +660,7 @@ async function main() {
   await markPhase(page, phases, "manual-interactions");
 
   if (args.autoDiscover) {
-    await autoDiscoverAndInteract(page, args);
+    interactions.push(...await autoDiscoverAndInteract(page, args));
   }
   await markPhase(page, phases, "auto-discover");
 
@@ -629,12 +693,15 @@ async function main() {
         `falling back to tallest-element measurement: ${Math.round(measured.distance)}px`
       );
     }
-    const distance = args.scrollDistance ?? Math.max(measured.distance, 4000);
+    const distance = args.scrollDistance ?? Math.max(0, measured.distance);
+    scrollEvidence.measuredDistance = Math.round(measured.distance);
+    scrollEvidence.requestedDistance = Math.round(distance);
     const steps = Math.max(1, Math.ceil(distance / args.scrollStep));
     console.error(`Scrolling ${Math.round(distance)}px over ${steps} step(s)`);
     for (let i = 0; i < steps; i++) {
       const scrollTimeout = Math.max(1000, Math.min(5000, args.scrollPause + 2000));
       try {
+        const before = await page.evaluate(() => Math.max(window.scrollY, document.documentElement.scrollTop, document.body?.scrollTop || 0)).catch(() => scrollEvidence.actualDistance);
         await withTimeout(page.mouse.wheel(0, args.scrollStep), scrollTimeout, "scroll input");
         await withTimeout(page.waitForTimeout(args.scrollPause), scrollTimeout, "scroll pause");
         await withTimeout(delayedCheck(page, "after-scroll-step", 100), scrollTimeout, "scroll reconciliation wait");
@@ -643,10 +710,15 @@ async function main() {
         scrollEvidence.timedOut = true;
         break;
       }
-      scrollEvidence.completedDistance += args.scrollStep;
+      const after = await page.evaluate(() => Math.max(window.scrollY, document.documentElement.scrollTop, document.body?.scrollTop || 0)).catch(() => before + args.scrollStep);
+      const actualDelta = Math.max(0, after - before);
+      scrollEvidence.actualDistance += actualDelta;
+      scrollEvidence.completedDistance = scrollEvidence.actualDistance;
       const reconciledConsent = await runConsentBounded(page, args, "after-scroll-step");
       consent = combineConsentResults(args.consentMode, consent.recorded || recordedConsent, reconciledConsent);
     }
+    scrollEvidence.truncated = scrollEvidence.timedOut || scrollEvidence.actualDistance + Math.max(args.scrollStep, 1) < distance;
+    scrollEvidence.completed = !scrollEvidence.truncated;
   }
   await markPhase(page, phases, "scroll");
 
@@ -659,8 +731,9 @@ async function main() {
   const jankReport = args.jankCheck ? await collectJankReport(page, args, phases, consent) : null;
   if (jankReport) {
     jankReport.interactionFailures = interactionFailures;
+    jankReport.interactions = interactions;
     jankReport.scroll = scrollEvidence;
-    jankReport.status = interactionFailures.length || scrollEvidence.timedOut || consent?.blindSpots?.length || consent?.verified === false || jankReport.observerError ? "partial" : "valid";
+    jankReport.status = interactionFailures.length || scrollEvidence.timedOut || scrollEvidence.truncated || consent?.blindSpots?.length || consent?.verified === false || jankReport.observerError ? "partial" : "valid";
   }
 
   const video = page.video();
@@ -712,3 +785,5 @@ main().catch((err) => {
   console.error("Capture failed:", err);
   process.exit(1);
 });
+
+export { parseArgs, isPrivateAddress, assertRemotePublicResolution, autoDiscoverAndInteract };

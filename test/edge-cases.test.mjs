@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, writeFile, stat, chmod } from "node:fs/promises";
+import { mkdir, writeFile, stat, chmod, symlink } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import {
@@ -17,7 +17,7 @@ import {
   validateCaptureInput,
   assertPublicResolution,
   isPrivateAddress,
-  captureSiteMotion,
+  captureSiteMotion as rawCaptureSiteMotion,
   ensureRemoteEncoder,
   checkCaptureGpu,
   callTool,
@@ -31,8 +31,14 @@ import {
   SERVER_NAME,
   SERVER_VERSION,
   DEFAULT_LOCAL_OUTPUT,
+  resolveOutputDirectory,
+  acquireCaptureLock,
 } from "../index.mjs";
 import { tempDir, shimBin, writeExecutable } from "./fixtures.mjs";
+
+function captureSiteMotion(input) {
+  return rawCaptureSiteMotion({ gpu: false, ...input });
+}
 
 test("run() handles timeouts, stderr data, error events, signals, and exit codes", async () => {
   // Timeout
@@ -96,11 +102,11 @@ test("run() handles timeouts, stderr data, error events, signals, and exit codes
   assert.match(signalResult.error.message, /stopped with signal SIGTERM/);
 });
 
-test("trimOutput() trims and truncates strings exceeding 4000 chars", () => {
+test("trimOutput() trims and truncates diagnostics to a bounded size", () => {
   assert.equal(trimOutput("  hello world  "), "hello world");
   const longText = "a".repeat(4500);
   const trimmed = trimOutput(longText);
-  assert.equal(trimmed.length, 4001); // 4000 slice + '…'
+  assert.equal(trimmed.length, 1201); // 1200 slice + '…'
   assert.ok(trimmed.endsWith("…"));
 });
 
@@ -117,12 +123,17 @@ test("public-resolution guards cover literal and DNS safety paths", async () => 
     "fc00::1",
     "fd12::1",
     "fe80::1",
+    "::ffff:192.168.1.1",
+    "100.64.0.1",
+    "198.18.0.1",
+    "224.0.0.1",
+    "2001:db8::1",
   ]) {
     assert.equal(isPrivateAddress(address), true, address);
   }
   assert.equal(isPrivateAddress("172.15.0.1"), false);
-  assert.equal(isPrivateAddress("2001:db8::1"), false);
-  await assert.doesNotReject(() => assertPublicResolution("https://[::1]/"));
+  assert.equal(isPrivateAddress("2001:db8::1"), true);
+  await assert.rejects(() => assertPublicResolution("https://[::1]/"), /public IP/);
   await assert.rejects(
     () => assertPublicResolution("https://localhost/"),
     /url must resolve only to public IP addresses/
@@ -131,6 +142,42 @@ test("public-resolution guards cover literal and DNS safety paths", async () => 
     () => assertPublicResolution("https://does-not-exist.invalid/"),
     /url host could not be resolved safely/
   );
+});
+
+test("GPU capture fails before resolving the worker and omitted scroll stays auto-measured", async () => {
+  await assert.rejects(
+    async () => captureSiteMotion({ url: "https://example.test", output_dir: await tempDir("gpu-required-"), gpu: true }),
+    /fresh GPU check/
+  );
+  assert.equal(validateCaptureInput({ url: "https://example.test" }).scrollDistance, null);
+});
+
+test("output roots are checked after symlink resolution", async () => {
+  const root = await tempDir("approved-output-");
+  const outside = "/etc";
+  const link = join(root, "linked");
+  await symlink(outside, link);
+  const previous = process.env.SITE_MOTION_APPROVED_OUTPUT_ROOT;
+  process.env.SITE_MOTION_APPROVED_OUTPUT_ROOT = root;
+  try {
+    await assert.rejects(() => resolveOutputDirectory(link), /approved workspace output root/);
+  } finally {
+    if (previous === undefined) delete process.env.SITE_MOTION_APPROVED_OUTPUT_ROOT;
+    else process.env.SITE_MOTION_APPROVED_OUTPUT_ROOT = previous;
+  }
+});
+
+test("stale lock owners can be reclaimed but live or malformed locks remain busy", async () => {
+  const out = await tempDir("lock-owner-");
+  const stale = join(out, ".stale.capture.lock");
+  await mkdir(stale);
+  await writeFile(join(stale, "owner.json"), JSON.stringify({ pid: 1, createdAt: Date.now() - 31 * 60 * 1000, token: "old" }));
+  const owner = await acquireCaptureLock(stale);
+  assert.equal(typeof owner.token, "string");
+  const live = join(out, ".live.capture.lock");
+  await mkdir(live);
+  await writeFile(join(live, "owner.json"), JSON.stringify({ pid: 1, createdAt: Date.now(), token: "live" }));
+  await assert.rejects(() => acquireCaptureLock(live), /capture_target_busy/);
 });
 
 test("shellQuote() escapes single quotes properly", () => {
@@ -170,43 +217,29 @@ test("parseSshUrl() parses URLs and handles default username and invalid formats
   assert.throws(() => parseSshUrl("ssh://remote.host"), /The Vast SSH endpoint must use ssh:\/\/user@host:port/);
 });
 
-test("resolveConnection() handles explicit host/port with and without user, and vastai success", async () => {
-  const prevHost = process.env.SITE_MOTION_SSH_HOST;
-  const prevPort = process.env.SITE_MOTION_SSH_PORT;
-  const prevUser = process.env.SITE_MOTION_SSH_USER;
+test("resolveConnection() requires an approved endpoint and supports Vast instance resolution", async () => {
   const prevUrl = process.env.SITE_MOTION_SSH_URL;
-  delete process.env.SITE_MOTION_SSH_URL;
+  const prevInstance = process.env.VAST_INSTANCE_ID;
+  const prevPath = process.env.PATH;
 
   try {
-    // Both host and port set, user unset -> default root
-    process.env.SITE_MOTION_SSH_HOST = "explicit.host";
-    process.env.SITE_MOTION_SSH_PORT = "2200";
-    delete process.env.SITE_MOTION_SSH_USER;
-    const connDefaultUser = await resolveConnection();
-    assert.deepEqual(connDefaultUser, { user: "root", host: "explicit.host", port: "2200" });
+    delete process.env.SITE_MOTION_SSH_URL;
+    delete process.env.VAST_INSTANCE_ID;
+    await assert.rejects(() => resolveConnection(), /Capture worker is not configured/);
 
-    // Host, port, user all set
-    process.env.SITE_MOTION_SSH_USER = "custom_user";
-    const connCustomUser = await resolveConnection();
-    assert.deepEqual(connCustomUser, { user: "custom_user", host: "explicit.host", port: "2200" });
+    process.env.SITE_MOTION_SSH_URL = "ssh://alice@remote.host:2222";
+    assert.deepEqual(await resolveConnection(), { user: "alice", host: "remote.host", port: "2222" });
 
-    // Only host set (missing port) -> should fall through to vastai
-    delete process.env.SITE_MOTION_SSH_PORT;
+    delete process.env.SITE_MOTION_SSH_URL;
+    process.env.VAST_INSTANCE_ID = "configured-instance";
     const bin = await shimBin();
     await writeExecutable(bin, "vastai", `process.stdout.write("ssh://vastuser@vast.host.test:33333\\n");`);
-    const prevPath = process.env.PATH;
     process.env.PATH = `${bin}:${process.env.PATH}`;
-    try {
-      const connFallthrough = await resolveConnection();
-      assert.deepEqual(connFallthrough, { user: "vastuser", host: "vast.host.test", port: "33333" });
-    } finally {
-      process.env.PATH = prevPath;
-    }
+    assert.deepEqual(await resolveConnection(), { user: "vastuser", host: "vast.host.test", port: "33333" });
   } finally {
-    if (prevHost !== undefined) process.env.SITE_MOTION_SSH_HOST = prevHost; else delete process.env.SITE_MOTION_SSH_HOST;
-    if (prevPort !== undefined) process.env.SITE_MOTION_SSH_PORT = prevPort; else delete process.env.SITE_MOTION_SSH_PORT;
-    if (prevUser !== undefined) process.env.SITE_MOTION_SSH_USER = prevUser; else delete process.env.SITE_MOTION_SSH_USER;
     if (prevUrl !== undefined) process.env.SITE_MOTION_SSH_URL = prevUrl; else delete process.env.SITE_MOTION_SSH_URL;
+    if (prevInstance !== undefined) process.env.VAST_INSTANCE_ID = prevInstance; else delete process.env.VAST_INSTANCE_ID;
+    process.env.PATH = prevPath;
   }
 });
 
@@ -706,15 +739,14 @@ if (dest.endsWith("manifest.json")) {
     const parsedFullReport = JSON.parse(resultFullOptions.content[0].text);
     assert.equal(parsedFullReport.cleanup, "confirmed");
 
-    const gpuStatusReport = await captureSiteMotion({
+    await assert.rejects(() => captureSiteMotion({
       url: "https://example.test",
       name: "no-consent",
       output_dir: out,
       overwrite: true,
       gpu: true,
       gpu_check_id: "stale-gpu-check",
-    });
-    assert.equal(JSON.parse(gpuStatusReport.content[0].text).status, "partial");
+    }), /fresh GPU check/);
 
     // A valid capture can still be partial when the recorder reports degraded status.
     const partialJank = JSON.stringify({ status: "partial", finalUrl: "https://final.example", interactionFailures: [] });
@@ -752,7 +784,7 @@ if (dest.endsWith("manifest.json")) {
     assert.equal(partialReport.finalUrl, "https://final.example");
     assert.deepEqual(partialReport.viewport, { width: 1920, height: 1080, mobile: false, reducedMotion: false });
 
-    const blockedGpuResult = await captureSiteMotion({
+    await assert.rejects(() => captureSiteMotion({
       url: "https://example.test",
       name: "partial",
       output_dir: out,
@@ -760,8 +792,7 @@ if (dest.endsWith("manifest.json")) {
       gpu: true,
       gpu_check_id: "stale-gpu-check",
       reduced_motion: true,
-    });
-    assert.equal(JSON.parse(blockedGpuResult.content[0].text).status, "partial");
+    }), /fresh GPU check/);
 
     // A transferred but unverified video is rejected before local promotion.
     await writeExecutable(bin, "ffprobe", "process.exit(1);");
@@ -788,7 +819,7 @@ process.stdout.write("ok\\n");
       "ssh",
       `
 const arg = process.argv.join(" ");
-if (arg.includes("node ") && arg.includes("capture.mjs")) {
+    if (arg.includes("--url") && arg.includes("capture.mjs")) {
   process.exit(1);
 } else if (arg.includes("rm -rf")) {
   process.exit(1);
@@ -975,7 +1006,7 @@ test("handleMessage() error formatting for Error instance vs non-Error values", 
   const reply2 = JSON.parse(writes[7]);
   assert.equal(reply2.id, 992);
   assert.equal(reply2.result.isError, true);
-  assert.equal(reply2.result.content[0].text, "primitive-string-error");
+  assert.match(reply2.result.content[0].text, /capture-error: primitive-string-error/);
 
   // 11. writeMessage and errorResult
   const originalWrite = process.stdout.write;
@@ -992,10 +1023,9 @@ test("handleMessage() error formatting for Error instance vs non-Error values", 
   assert.equal(directWrite, '{"test":123}\n');
 
   const errRes = errorResult("custom-err");
-  assert.deepEqual(errRes, {
-    content: [{ type: "text", text: "custom-err" }],
-    isError: true,
-  });
+  assert.equal(errRes.isError, true);
+  assert.equal(errRes.structuredContent.reasonCode, "capture-error");
+  assert.match(errRes.content[0].text, /custom-err/);
 });
 
 test("additional branch coverage for input parameters and http urls", () => {
@@ -1072,24 +1102,21 @@ test("resolveConnection vastai error and missing endpoint branches", async () =>
   const bin = await shimBin();
   const prevPath = process.env.PATH;
   const prevUrl = process.env.SITE_MOTION_SSH_URL;
-  const prevHost = process.env.SITE_MOTION_SSH_HOST;
-  const prevPort = process.env.SITE_MOTION_SSH_PORT;
+  const prevInstance = process.env.VAST_INSTANCE_ID;
   delete process.env.SITE_MOTION_SSH_URL;
-  delete process.env.SITE_MOTION_SSH_HOST;
-  delete process.env.SITE_MOTION_SSH_PORT;
+  process.env.VAST_INSTANCE_ID = "stale-instance";
   process.env.PATH = `${bin}:${process.env.PATH}`;
 
   try {
     await writeExecutable(bin, "vastai", "process.exit(1);");
-    await assert.rejects(() => resolveConnection(), /Could not resolve the Vast SSH endpoint/);
+    await assert.rejects(() => resolveConnection(), /configured capture worker is unavailable/);
 
     await writeExecutable(bin, "vastai", "process.stdout.write('invalid\\n');");
-    await assert.rejects(() => resolveConnection(), /The Vast CLI did not return an SSH endpoint/);
+    await assert.rejects(() => resolveConnection(), /configured Vast instance did not provide an SSH endpoint/);
   } finally {
     process.env.PATH = prevPath;
     if (prevUrl !== undefined) process.env.SITE_MOTION_SSH_URL = prevUrl;
-    if (prevHost !== undefined) process.env.SITE_MOTION_SSH_HOST = prevHost;
-    if (prevPort !== undefined) process.env.SITE_MOTION_SSH_PORT = prevPort;
+    if (prevInstance !== undefined) process.env.VAST_INSTANCE_ID = prevInstance; else delete process.env.VAST_INSTANCE_ID;
   }
 });
 

@@ -94,9 +94,24 @@ The server has no npm dependencies. The launcher sources `~/.zsh_secrets` for
 the Vast API key and the Vast CLI environment. The API key does not appear in
 the MCP configuration.
 
-The launcher resolves the SSH endpoint for instance `48790763` with the Vast
-CLI. Override it with `VAST_INSTANCE_ID` or `SITE_MOTION_SSH_URL` when the
-capture VM changes.
+The launcher requires an explicit worker configuration. Set `VAST_INSTANCE_ID`
+for Vast CLI resolution, or set `SITE_MOTION_SSH_URL` to an explicit
+`ssh://user@host:port` endpoint. There is no default instance. If neither is
+configured, tools return an `isError: true` blocked result with reason code
+`capture-worker-unconfigured`. Stale or unavailable workers return
+`capture-worker-unavailable`, and bounded preflight diagnostics never include
+API keys, tokens, passwords, or SSH URL passwords.
 
-The remote recorder must exist at `/workspace/site-motion-capture` and must
-provide `capture.mjs` and `check-gpu-renderer.mjs`.
+Before capture, the launcher verifies SSH reachability, the remote recorder at
+`/workspace/site-motion-capture`, `capture.mjs`, `check-gpu-renderer.mjs`,
+Node/Playwright, and `ffprobe`. GPU capture also requires a fresh
+`check_capture_gpu` result. Missing files, dependencies, GPU, WebGL, or a
+bounded SSH/preflight timeout return structured blocked errors and do not
+create local evidence artifacts.
+
+The worker checks each HTTP or HTTPS request, including redirects and
+subresources. It blocks requests whose DNS answers include private or reserved
+addresses. For the starting host, the worker also requires a match with the
+bridge's DNS answers when the bridge returns IP addresses. Chromium resolves
+the host again when it connects, so a DNS change after the check can still
+affect the connection.

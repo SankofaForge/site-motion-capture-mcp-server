@@ -16,7 +16,11 @@ function server(messages, env = {}) {
     child.stdout.on("data", (chunk) => { output += chunk; });
     child.on("error", reject);
     child.on("close", (code) => code === 0 ? resolve(output.trim().split("\n").filter(Boolean).map(JSON.parse)) : reject(new Error(`exit ${code}: ${output}`)));
-    child.stdin.end(messages.map((message) => JSON.stringify(message)).join("\n") + "\n");
+    child.stdin.end(messages.map((message) => {
+      const params = message?.params;
+      if (params?.name !== "capture_site_motion" || !params.arguments || typeof params.arguments !== "object" || params.arguments.gpu !== undefined) return JSON.stringify(message);
+      return JSON.stringify({ ...message, params: { ...params, arguments: { gpu: false, ...params.arguments } } });
+    }).join("\n") + "\n");
   });
 }
 
@@ -48,7 +52,7 @@ else fs.writeFileSync(dest, "webm");
 `);
   const replies = await server([{ jsonrpc: "2.0", id: 8, method: "tools/call", params: {
     name: "capture_site_motion", arguments: { url: "https://example.test", name: "forwarded", output_dir: out,
-      consent_mode: "none", consent_selector: "#custom", scroll_distance: 7, scroll_step: 3, gpu: false },
+      consent_mode: "none", consent_selector: "#custom", scroll_distance: 7, scroll_step: 3, auto_discover: true, gpu: false },
   } }], { PATH: `${bin}:${process.env.PATH}`, SITE_MOTION_SSH_URL: "ssh://root@fixture.test:22" });
   assert.equal(replies[0].id, 8);
   assert.equal(replies[0].result.content[0].type, "text");
@@ -57,7 +61,40 @@ else fs.writeFileSync(dest, "webm");
   assert.match(callsText, /'--consent-selector' '#custom'/);
   assert.match(callsText, /'--scroll-distance' '7'/);
   assert.match(callsText, /'--scroll-step' '3'/);
+  assert.match(callsText, /'--auto-discover'/);
   assert.match(callsText, /--consent-budget-ms' '8000'/);
+});
+
+test("local evidence survives remote cleanup failure and reports pending cleanup", async () => {
+  const bin = await shimBin();
+  const out = await tempDir("site-motion-cleanup-");
+  await writeExecutable(bin, "ffprobe", `process.stdout.write(JSON.stringify({ format: { format_name: "matroska,webm", duration: "1.0" } }));`);
+  await writeExecutable(bin, "ssh", `
+const arg = process.argv.at(-1);
+if (arg.includes("rm -rf") || arg.includes("'rm' '-rf'")) process.exit(1);
+process.stdout.write("ok\\n");
+`);
+  await writeExecutable(bin, "scp", `
+const fs = require("node:fs");
+const crypto = require("node:crypto");
+const path = require("node:path");
+const dest = process.argv.at(-1);
+const stage = path.dirname(dest);
+const video = Buffer.from("fake-video");
+const jank = Buffer.from(JSON.stringify({ status: "valid", consent: { action: "rejected" } }));
+const file = (name, data) => ({ path: name, size: data.length, sha256: crypto.createHash("sha256").update(data).digest("hex") });
+if (dest.endsWith("manifest.json")) fs.writeFileSync(dest, JSON.stringify({ runId: path.basename(stage).replace(/^\\.capture-/, ""), files: [file("cleanup.webm", video), file("cleanup.jank.json", jank)] }));
+else if (dest.endsWith(".webm")) fs.writeFileSync(dest, video);
+else fs.writeFileSync(dest, jank);
+`);
+  const replies = await server([{ jsonrpc: "2.0", id: 81, method: "tools/call", params: {
+    name: "capture_site_motion", arguments: { url: "https://example.test", name: "cleanup", output_dir: out, gpu: false },
+  } }], { PATH: `${bin}:${process.env.PATH}`, SITE_MOTION_SSH_URL: "ssh://root@fixture.test:22" });
+  const result = JSON.parse(replies[0].result.content[0].text);
+  assert.equal(result.cleanup, "pending");
+  assert.match(result.cleanupError, /exited with code 1/);
+  const { readFile } = await import("node:fs/promises");
+  assert.equal(await readFile(join(out, "cleanup.webm"), "utf8"), "fake-video");
 });
 
 test("bridge protects existing outputs unless overwrite is explicit", async () => {
@@ -76,7 +113,7 @@ test("remote timeout/error propagation attempts PID termination cleanup", async 
   const calls = join(bin, "cleanup-calls");
   await writeExecutable(bin, "ssh", `
 const fs = require("node:fs"); const arg = process.argv.at(-1); fs.appendFileSync(${JSON.stringify(calls)}, arg + "\\n");
-if (arg.includes("capture.mjs")) process.exit(124);
+if (arg.includes("--url") && arg.includes("capture.mjs")) process.exit(124);
 `);
   const replies = await server([{ jsonrpc: "2.0", id: 10, method: "tools/call", params: {
     name: "capture_site_motion", arguments: { url: "https://example.test", name: "timeout-cleanup", output_dir: await tempDir("site-motion-timeout-") },
