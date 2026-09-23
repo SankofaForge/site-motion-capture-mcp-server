@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, stat, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -26,7 +26,12 @@ function server(messages, env = {}) {
         reject(new Error(`exit ${code}: ${output}`));
       }
     });
-    const input = messages.map((m) => (typeof m === "string" ? m : JSON.stringify(m))).join("\n") + "\n";
+    const input = messages.map((m) => {
+      if (typeof m === "string") return m;
+      const params = m?.params;
+      if (params?.name !== "capture_site_motion" || !params.arguments || typeof params.arguments !== "object" || params.arguments.gpu !== undefined) return JSON.stringify(m);
+      return JSON.stringify({ ...m, params: { ...params, arguments: { gpu: false, ...params.arguments } } });
+    }).join("\n") + "\n";
     child.stdin.end(input);
   });
 }
@@ -55,9 +60,7 @@ if (arg.includes("nvidia-smi")) {
     ],
     {
       PATH: `${bin}:${process.env.PATH}`,
-      SITE_MOTION_SSH_HOST: "gpu.fixture.test",
-      SITE_MOTION_SSH_PORT: "22022",
-      SITE_MOTION_SSH_USER: "customuser",
+      SITE_MOTION_SSH_URL: "ssh://customuser@gpu.fixture.test:22022",
     }
   );
 
@@ -246,6 +249,7 @@ test("SSH connection endpoint parsing and resolution", async () => {
     ],
     { SITE_MOTION_SSH_URL: "invalid-url" }
   );
+  assert.equal(replies[0].result.structuredContent.reasonCode, "capture-worker-malformed-url");
   assert.match(replies[0].result.content[0].text, /not a valid ssh:\/\/ URL/);
 
   // Non-SSH protocol URL
@@ -260,6 +264,7 @@ test("SSH connection endpoint parsing and resolution", async () => {
     ],
     { SITE_MOTION_SSH_URL: "https://example.com:22" }
   );
+  assert.equal(replies[0].result.structuredContent.reasonCode, "capture-worker-malformed-url");
   assert.match(replies[0].result.content[0].text, /must use ssh:\/\/user@host:port/);
 
   // Vast CLI resolution failure
@@ -283,7 +288,7 @@ if (process.argv.includes("fail")) {
     ],
     { PATH: `${bin}:${process.env.PATH}`, VAST_INSTANCE_ID: "fail" }
   );
-  assert.match(replies[0].result.content[0].text, /Could not resolve the Vast SSH endpoint/);
+  assert.equal(replies[0].result.structuredContent.reasonCode, "capture-worker-unavailable");
 
   replies = await server(
     [
@@ -294,9 +299,85 @@ if (process.argv.includes("fail")) {
         params: { name: "check_capture_gpu", arguments: {} },
       },
     ],
-    { PATH: `${bin}:${process.env.PATH}`, VAST_INSTANCE_ID: "48790763" }
+    { PATH: `${bin}:${process.env.PATH}`, VAST_INSTANCE_ID: "stale-instance" }
   );
-  assert.match(replies[0].result.content[0].text, /Vast CLI did not return an SSH endpoint/);
+  assert.equal(replies[0].result.structuredContent.reasonCode, "capture-worker-unavailable");
+  assert.equal(replies[0].result.isError, true);
+});
+
+test("worker configuration is required and has structured blocked errors", async () => {
+  const replies = await server([
+    { jsonrpc: "2.0", id: 305, method: "tools/call", params: { name: "check_capture_gpu", arguments: {} } },
+  ], { SITE_MOTION_SSH_URL: "", VAST_INSTANCE_ID: "" });
+  assert.equal(replies[0].result.isError, true);
+  assert.equal(replies[0].result.structuredContent.status, "blocked");
+  assert.equal(replies[0].result.structuredContent.reasonCode, "capture-worker-unconfigured");
+  assert.doesNotMatch(replies[0].result.content[0].text, /48790763/);
+});
+
+test("SIGTERM cancels a pending worker resolution", async () => {
+  const bin = await shimBin();
+  const started = join(bin, "vastai-started");
+  await writeExecutable(bin, "vastai", `
+require("node:fs").writeFileSync(${JSON.stringify(started)}, "started");
+setTimeout(() => {}, 5000);
+`);
+  const child = spawn(process.execPath, [join(root, "index.mjs")], {
+    cwd: root,
+    env: {
+      ...process.env,
+      PATH: `${bin}:${process.env.PATH}`,
+      SITE_MOTION_SSH_URL: "",
+      VAST_INSTANCE_ID: "fixture",
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const closePromise = new Promise((resolve) => child.once("close", resolve));
+  let output = "";
+  const replyPromise = new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("server did not return a cancellation response")), 2000);
+    child.stdout.on("data", (chunk) => {
+      output += chunk;
+      const line = output.split("\n").find(Boolean);
+      if (!line) return;
+      clearTimeout(timeout);
+      resolve(JSON.parse(line));
+    });
+    child.once("error", reject);
+  });
+  try {
+    child.stdin.write(`${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 306,
+      method: "tools/call",
+      params: { name: "capture_site_motion", arguments: { url: "https://example.test", gpu: false } },
+    })}\n`);
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      try {
+        await stat(started);
+        break;
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    }
+    await stat(started);
+    child.kill("SIGTERM");
+    const reply = await replyPromise;
+    child.stdin.end();
+    const code = await closePromise;
+    assert.equal(code, 0);
+    assert.equal(reply.result.isError, true);
+    assert.match(reply.result.content[0].text, /Capture was cancelled/);
+  } finally {
+    if (child.exitCode === null) child.kill("SIGTERM");
+    child.stdin.destroy();
+    let cleanupTimeout;
+    await Promise.race([
+      closePromise,
+      new Promise((resolve) => { cleanupTimeout = setTimeout(resolve, 1000); }),
+    ]);
+    clearTimeout(cleanupTimeout);
+  }
 });
 
 test("lock conflict reports capture_target_busy", async () => {
@@ -313,7 +394,7 @@ test("lock conflict reports capture_target_busy", async () => {
         arguments: { url: "https://example.test", name: "test-busy", output_dir: out },
       },
     },
-  ]);
+  ], { SITE_MOTION_SSH_URL: "ssh://root@fixture.test:22" });
   assert.equal(replies[0].result.isError, true);
   assert.match(replies[0].result.content[0].text, /capture_target_busy/);
 });

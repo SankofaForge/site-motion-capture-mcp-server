@@ -7,7 +7,7 @@ async function loadRecorder() {
   let source = await readFile(new URL("../remote/capture.mjs", import.meta.url), "utf8");
   source = source.replace('import { chromium } from "playwright";', "const chromium = {};" );
   source = source.replace(/\nmain\(\)\.catch\([\s\S]*$/, "");
-  source += "\nexport { writeManifest };\n";
+  source += "\nexport { writeManifest, parseArgs, isPrivateAddress, assertRemotePublicResolution };\n";
   return import(`data:text/javascript,${encodeURIComponent(source)}`);
 }
 
@@ -22,4 +22,16 @@ test("manifest uses safe basename paths and bridge validates the same field", as
 
   const bridge = await readFile(new URL("../index.mjs", import.meta.url), "utf8");
   assert.match(bridge, /join\(stageDir, file\.path\)/);
+});
+
+test("remote recorder defaults to measured scrolling and accepts bridge DNS evidence", async () => {
+  const { parseArgs, isPrivateAddress, assertRemotePublicResolution } = await loadRecorder();
+  const args = parseArgs(["--url", "https://example.test", "--expected-addresses", "[]"]);
+  assert.equal(args.scrollDistance, null);
+  assert.deepEqual(args.expectedAddresses, []);
+  assert.equal(isPrivateAddress("::ffff:192.168.1.1"), true);
+  await assert.rejects(
+    () => assertRemotePublicResolution("https://localhost/", ["8.8.8.8"]),
+    /not public/
+  );
 });
