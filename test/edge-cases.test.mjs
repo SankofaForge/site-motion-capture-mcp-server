@@ -16,6 +16,7 @@ import {
   booleanOption,
   validateCaptureInput,
   assertPublicResolution,
+  resolvePublicAddresses,
   isPrivateAddress,
   captureSiteMotion as rawCaptureSiteMotion,
   ensureRemoteEncoder,
@@ -32,7 +33,11 @@ import {
   SERVER_VERSION,
   DEFAULT_LOCAL_OUTPUT,
   resolveOutputDirectory,
+  resolveExistingAncestor,
   acquireCaptureLock,
+  releaseCaptureLock,
+  verifyRemoteWorker,
+  workerPreflightError,
 } from "../index.mjs";
 import { tempDir, shimBin, writeExecutable } from "./fixtures.mjs";
 
@@ -167,6 +172,59 @@ test("output roots are checked after symlink resolution", async () => {
   }
 });
 
+test("output root checks cover missing paths, unresolved links, and post-create changes", async () => {
+  const root = await tempDir("approved-output-paths-");
+  const previous = process.env.SITE_MOTION_APPROVED_OUTPUT_ROOT;
+  process.env.SITE_MOTION_APPROVED_OUTPUT_ROOT = root;
+  try {
+    const nested = join(root, "missing", "output");
+    const originalRealpath = (await import("node:fs/promises")).realpath;
+    assert.equal(await resolveOutputDirectory(nested), await originalRealpath(nested));
+
+    const dangling = join(root, "dangling");
+    await symlink(join(root, "missing-target"), dangling);
+    await assert.rejects(
+      () => resolveOutputDirectory(join(dangling, "child")),
+      /unresolved symbolic link/
+    );
+
+    const fileParent = join(root, "file-parent");
+    await writeFile(fileParent, "not a directory");
+    await assert.rejects(() => resolveOutputDirectory(join(fileParent, "child")), { code: "ENOTDIR" });
+
+    let requestedPathChecks = 0;
+    const pathRealpath = async (path) => {
+      if (path === nested && requestedPathChecks++ === 1) return "/etc";
+      return originalRealpath(path);
+    };
+    await assert.rejects(
+      () => resolveOutputDirectory(nested, { pathRealpath }),
+      /approved workspace output root/
+    );
+
+    const missing = Object.assign(new Error("missing ancestor"), { code: "ENOENT" });
+    await assert.rejects(
+      () => resolveExistingAncestor("/virtual/root", {
+        pathRealpath: async () => { throw missing; },
+        pathLstat: async () => { throw missing; },
+        pathDirname: (path) => path,
+      }),
+      (error) => error === missing
+    );
+    await assert.rejects(
+      () => resolveExistingAncestor("/virtual/file", {
+        pathRealpath: async () => { throw missing; },
+        pathLstat: async () => ({ isSymbolicLink: () => false }),
+        pathDirname: (path) => path,
+      }),
+      (error) => error === missing
+    );
+  } finally {
+    if (previous === undefined) delete process.env.SITE_MOTION_APPROVED_OUTPUT_ROOT;
+    else process.env.SITE_MOTION_APPROVED_OUTPUT_ROOT = previous;
+  }
+});
+
 test("stale lock owners can be reclaimed but live or malformed locks remain busy", async () => {
   const out = await tempDir("lock-owner-");
   const stale = join(out, ".stale.capture.lock");
@@ -178,6 +236,88 @@ test("stale lock owners can be reclaimed but live or malformed locks remain busy
   await mkdir(live);
   await writeFile(join(live, "owner.json"), JSON.stringify({ pid: 1, createdAt: Date.now(), token: "live" }));
   await assert.rejects(() => acquireCaptureLock(live), /capture_target_busy/);
+});
+
+test("capture lock cleanup removes failed owner writes and preserves other owners", async () => {
+  const out = await tempDir("lock-cleanup-");
+  const failed = join(out, "failed.capture.lock");
+  const writeError = Object.assign(new Error("owner write failed"), { code: "EIO" });
+  await assert.rejects(
+    () => acquireCaptureLock(failed, { writeOwner: async () => { throw writeError; } }),
+    /owner write failed/
+  );
+  await assert.rejects(() => stat(failed), { code: "ENOENT" });
+
+  const missingOwner = join(out, "missing-owner.capture.lock");
+  await mkdir(missingOwner);
+  await releaseCaptureLock(missingOwner, { token: "mine" });
+
+  const otherOwner = join(out, "other-owner.capture.lock");
+  await mkdir(otherOwner);
+  await writeFile(join(otherOwner, "owner.json"), JSON.stringify({ token: "theirs" }));
+  await releaseCaptureLock(otherOwner, { token: "mine" });
+  assert.equal((await stat(join(otherOwner, "owner.json"))).isFile(), true);
+
+  const malformedOwner = join(out, "malformed-owner.capture.lock");
+  await mkdir(malformedOwner);
+  await writeFile(join(malformedOwner, "owner.json"), "{");
+  await assert.rejects(() => releaseCaptureLock(malformedOwner, { token: "mine" }), SyntaxError);
+});
+
+test("public DNS resolution sorts records and rejects empty or failed lookups", async () => {
+  const dns = async () => [{ address: "8.8.8.8" }, { address: "1.1.1.1" }];
+  assert.deepEqual(
+    await resolvePublicAddresses("https://resolver.fixture.test", dns),
+    ["1.1.1.1", "8.8.8.8"]
+  );
+  await assert.rejects(
+    () => resolvePublicAddresses("https://resolver.fixture.test", async () => { throw new Error("dns error"); }),
+    /url host could not be resolved safely/
+  );
+  await assert.rejects(
+    () => assertPublicResolution("https://empty.fixture.test", async () => []),
+    /url must resolve only to public IP addresses/
+  );
+});
+
+test("worker preflight errors classify diagnostics and cover remote failures", async () => {
+  const cases = [
+    [new Error("request timed out"), "capture-worker-timeout"],
+    [new Error("missing capture.mjs"), "capture-worker-files-missing"],
+    [new Error("missing check-gpu-renderer.mjs"), "capture-worker-files-missing"],
+    [new Error("missing node"), "capture-worker-dependency-missing"],
+    [new Error("missing ffprobe"), "capture-worker-dependency-missing"],
+    [new Error("missing playwright"), "capture-worker-dependency-missing"],
+    [new Error("Cannot find package 'playwright'"), "capture-worker-dependency-missing"],
+    [new Error("connection refused"), "capture-worker-unavailable"],
+    [new Error("could not resolve hostname"), "capture-worker-unavailable"],
+    [new Error("no route to host"), "capture-worker-unavailable"],
+    [new Error("permission denied"), "capture-worker-unavailable"],
+    [new Error("host key verification failed"), "capture-worker-unavailable"],
+    [new Error("name or service not known"), "capture-worker-unavailable"],
+    [new Error("unknown preflight failure"), "capture-worker-preflight-failed"],
+    ["unknown non-error preflight failure", "capture-worker-preflight-failed"],
+  ];
+  for (const [diagnostic, reasonCode] of cases) {
+    assert.equal(workerPreflightError(diagnostic).reasonCode, reasonCode);
+  }
+
+  const bin = await shimBin();
+  const previousPath = process.env.PATH;
+  const previousUrl = process.env.SITE_MOTION_SSH_URL;
+  process.env.PATH = `${bin}:${previousPath}`;
+  process.env.SITE_MOTION_SSH_URL = "ssh://root@fixture.test:22";
+  await writeExecutable(bin, "ssh", "process.stderr.write('connection refused'); process.exit(255);");
+  try {
+    await assert.rejects(
+      () => verifyRemoteWorker({ user: "root", host: "fixture.test", port: "22" }),
+      /capture worker is unavailable/
+    );
+  } finally {
+    process.env.PATH = previousPath;
+    if (previousUrl === undefined) delete process.env.SITE_MOTION_SSH_URL;
+    else process.env.SITE_MOTION_SSH_URL = previousUrl;
+  }
 });
 
 test("shellQuote() escapes single quotes properly", () => {
@@ -923,6 +1063,59 @@ if (arg.includes("nvidia-smi")) {
   }
 });
 
+test("checkCaptureGpu reports NVIDIA and Chromium renderer failures", async () => {
+  const bin = await shimBin();
+  const previousPath = process.env.PATH;
+  const previousUrl = process.env.SITE_MOTION_SSH_URL;
+  process.env.PATH = `${bin}:${previousPath}`;
+  process.env.SITE_MOTION_SSH_URL = "ssh://root@fixture.test:22";
+  try {
+    await writeExecutable(bin, "ssh", `
+const arg = process.argv.join(" ");
+if (arg.includes("nvidia-smi")) process.exit(1);
+process.stdout.write("worker ready\\n");
+`);
+    await assert.rejects(() => checkCaptureGpu(), /capture worker GPU check failed/);
+
+    await writeExecutable(bin, "ssh", `
+const arg = process.argv.join(" ");
+if (arg.includes("check-gpu-renderer.mjs")) process.exit(1);
+if (arg.includes("nvidia-smi")) process.stdout.write("NVIDIA RTX fixture\\n");
+else process.stdout.write("worker ready\\n");
+`);
+    await assert.rejects(() => checkCaptureGpu(), /capture worker WebGL check failed/);
+
+    const connection = { user: "root", host: "fixture.test", port: "22" };
+    const verifyWorker = async () => {};
+    await assert.rejects(
+      () => checkCaptureGpu({
+        resolveWorker: async () => connection,
+        verifyWorker,
+        remoteRunner: async () => { throw "GPU failure"; },
+      }),
+      (error) => error.reasonCode === "capture-gpu-unavailable" && error.diagnostic === "GPU failure"
+    );
+
+    let remoteCall = 0;
+    await assert.rejects(
+      () => checkCaptureGpu({
+        resolveWorker: async () => connection,
+        verifyWorker,
+        remoteRunner: async () => {
+          remoteCall += 1;
+          if (remoteCall === 1) return { stdout: "NVIDIA RTX fixture" };
+          throw "renderer failure";
+        },
+      }),
+      (error) => error.reasonCode === "capture-gpu-webgl-unavailable" && error.diagnostic === "renderer failure"
+    );
+  } finally {
+    process.env.PATH = previousPath;
+    if (previousUrl === undefined) delete process.env.SITE_MOTION_SSH_URL;
+    else process.env.SITE_MOTION_SSH_URL = previousUrl;
+  }
+});
+
 test("handleMessage() error formatting for Error instance vs non-Error values", async () => {
   const writes = [];
   const write = (message) => writes.push(`${JSON.stringify(message)}\n`);
@@ -1113,6 +1306,9 @@ test("resolveConnection vastai error and missing endpoint branches", async () =>
 
     await writeExecutable(bin, "vastai", "process.stdout.write('invalid\\n');");
     await assert.rejects(() => resolveConnection(), /configured Vast instance did not provide an SSH endpoint/);
+
+    await writeExecutable(bin, "vastai", "process.stdout.write('ssh://invalid-host\\n');");
+    await assert.rejects(() => resolveConnection(), /configured Vast instance returned an invalid SSH endpoint/);
   } finally {
     process.env.PATH = prevPath;
     if (prevUrl !== undefined) process.env.SITE_MOTION_SSH_URL = prevUrl;

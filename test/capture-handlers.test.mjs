@@ -315,6 +315,71 @@ test("worker configuration is required and has structured blocked errors", async
   assert.doesNotMatch(replies[0].result.content[0].text, /48790763/);
 });
 
+test("SIGTERM cancels a pending worker resolution", async () => {
+  const bin = await shimBin();
+  const started = join(bin, "vastai-started");
+  await writeExecutable(bin, "vastai", `
+require("node:fs").writeFileSync(${JSON.stringify(started)}, "started");
+setTimeout(() => {}, 5000);
+`);
+  const child = spawn(process.execPath, [join(root, "index.mjs")], {
+    cwd: root,
+    env: {
+      ...process.env,
+      PATH: `${bin}:${process.env.PATH}`,
+      SITE_MOTION_SSH_URL: "",
+      VAST_INSTANCE_ID: "fixture",
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const closePromise = new Promise((resolve) => child.once("close", resolve));
+  let output = "";
+  const replyPromise = new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("server did not return a cancellation response")), 2000);
+    child.stdout.on("data", (chunk) => {
+      output += chunk;
+      const line = output.split("\n").find(Boolean);
+      if (!line) return;
+      clearTimeout(timeout);
+      resolve(JSON.parse(line));
+    });
+    child.once("error", reject);
+  });
+  try {
+    child.stdin.write(`${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 306,
+      method: "tools/call",
+      params: { name: "capture_site_motion", arguments: { url: "https://example.test", gpu: false } },
+    })}\n`);
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      try {
+        await stat(started);
+        break;
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    }
+    await stat(started);
+    child.kill("SIGTERM");
+    const reply = await replyPromise;
+    child.stdin.end();
+    const code = await closePromise;
+    assert.equal(code, 0);
+    assert.equal(reply.result.isError, true);
+    assert.match(reply.result.content[0].text, /Capture was cancelled/);
+  } finally {
+    if (child.exitCode === null) child.kill("SIGTERM");
+    child.stdin.destroy();
+    let cleanupTimeout;
+    await Promise.race([
+      closePromise,
+      new Promise((resolve) => { cleanupTimeout = setTimeout(resolve, 1000); }),
+    ]);
+    clearTimeout(cleanupTimeout);
+  }
+});
+
 test("lock conflict reports capture_target_busy", async () => {
   const out = await tempDir("lock-test-");
   await mkdir(join(out, ".test-busy.capture.lock"));
@@ -329,7 +394,7 @@ test("lock conflict reports capture_target_busy", async () => {
         arguments: { url: "https://example.test", name: "test-busy", output_dir: out },
       },
     },
-  ]);
+  ], { SITE_MOTION_SSH_URL: "ssh://root@fixture.test:22" });
   assert.equal(replies[0].result.isError, true);
   assert.match(replies[0].result.content[0].text, /capture_target_busy/);
 });

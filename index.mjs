@@ -527,44 +527,49 @@ function isWithinRoot(root, candidate) {
   );
 }
 
-async function resolveExistingAncestor(path) {
+async function resolveExistingAncestor(
+  path,
+  { pathRealpath = realpath, pathLstat = lstat, pathDirname = dirname } = {},
+) {
   let current = path;
   while (true) {
     try {
-      return await realpath(current);
+      return await pathRealpath(current);
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
       try {
-        const info = await lstat(current);
+        const info = await pathLstat(current);
         if (info.isSymbolicLink()) throw new Error("output_dir contains an unresolved symbolic link.");
         throw error;
       } catch (parentError) {
         if (parentError.code !== "ENOENT") throw parentError;
       }
-      const parent = dirname(current);
+      const parent = pathDirname(current);
       if (parent === current) throw error;
       current = parent;
     }
   }
 }
 
-async function resolveOutputDirectory(outputDir) {
+function assertApprovedOutputDirectory(approvedRoots, candidate) {
+  if (!approvedRoots.some((root) => isWithinRoot(root, candidate))) {
+    throw new Error("output_dir must remain inside the approved workspace output root.");
+  }
+}
+
+async function resolveOutputDirectory(outputDir, { pathRealpath = realpath } = {}) {
   const requestedOutput = resolve(outputDir);
   const configuredRoot = resolve(process.env.SITE_MOTION_APPROVED_OUTPUT_ROOT || process.cwd());
-  const approvedRoots = await Promise.all([configuredRoot, resolve(tmpdir())].map((root) => realpath(root)));
-  const existingAncestor = await resolveExistingAncestor(requestedOutput);
-  if (!approvedRoots.some((root) => isWithinRoot(root, existingAncestor))) {
-    throw new Error("output_dir must remain inside the approved workspace output root.");
-  }
+  const approvedRoots = await Promise.all([configuredRoot, resolve(tmpdir())].map((root) => pathRealpath(root)));
+  const existingAncestor = await resolveExistingAncestor(requestedOutput, { pathRealpath });
+  assertApprovedOutputDirectory(approvedRoots, existingAncestor);
   await mkdir(requestedOutput, { recursive: true });
-  const resolvedOutput = await realpath(requestedOutput);
-  if (!approvedRoots.some((root) => isWithinRoot(root, resolvedOutput))) {
-    throw new Error("output_dir must remain inside the approved workspace output root.");
-  }
+  const resolvedOutput = await pathRealpath(requestedOutput);
+  assertApprovedOutputDirectory(approvedRoots, resolvedOutput);
   return resolvedOutput;
 }
 
-async function acquireCaptureLock(lockPath) {
+async function acquireCaptureLock(lockPath, { writeOwner = writeFile, removeLock = rm } = {}) {
   const owner = { pid: process.pid, createdAt: Date.now(), token: randomUUID() };
   let lockCreated = false;
   try {
@@ -597,9 +602,9 @@ async function acquireCaptureLock(lockPath) {
     }
   }
   try {
-    await writeFile(join(lockPath, "owner.json"), JSON.stringify(owner), { flag: "wx" });
+    await writeOwner(join(lockPath, "owner.json"), JSON.stringify(owner), { flag: "wx" });
   } catch (error) {
-    if (lockCreated) await rm(lockPath, { recursive: true, force: true });
+    if (lockCreated) await removeLock(lockPath, { recursive: true, force: true });
     throw error;
   }
   return owner;
@@ -865,10 +870,10 @@ async function captureSiteMotionWithController(input, controller) {
   }
 }
 
-async function assertPublicResolution(rawUrl) {
+async function assertPublicResolution(rawUrl, resolveAddresses = resolvePublicAddresses) {
   const hostname = new URL(rawUrl).hostname.replace(/^\[|\]$/g, "");
   if (hostname === "example.test") return;
-  const addresses = await resolvePublicAddresses(rawUrl);
+  const addresses = await resolveAddresses(rawUrl);
   if (!addresses.length) {
     throw new Error("url must resolve only to public IP addresses");
   }
@@ -903,13 +908,13 @@ function inIpv6Range(value, base, bits) {
   return (value & mask) === (base & mask);
 }
 
-async function resolvePublicAddresses(rawUrl) {
+async function resolvePublicAddresses(rawUrl, lookupHostname = lookup) {
   const hostname = new URL(rawUrl).hostname.replace(/^\[|\]$/g, "");
   if (hostname === "example.test") return [hostname];
   if (isPrivateAddress(hostname)) throw new Error("url must resolve only to public IP addresses");
   if (isIP(hostname)) return [hostname];
   let records;
-  try { records = await lookup(hostname, { all: true, verbatim: true }); } catch { throw new Error("url host could not be resolved safely"); }
+  try { records = await lookupHostname(hostname, { all: true, verbatim: true }); } catch { throw new Error("url host could not be resolved safely"); }
   const addresses = records.map(({ address }) => address);
   if (!addresses.length || addresses.some(isPrivateAddress)) throw new Error("url must resolve only to public IP addresses");
   return addresses.sort();
@@ -931,12 +936,16 @@ async function ensureRemoteEncoder(connection, signal) {
   await runRemoteCommand(connection, command, 30000, lockPath, signal);
 }
 
-async function checkCaptureGpu() {
-  const connection = await resolveConnection();
-  await verifyRemoteWorker(connection);
+async function checkCaptureGpu({
+  resolveWorker = resolveConnection,
+  verifyWorker = verifyRemoteWorker,
+  remoteRunner = runRemote,
+} = {}) {
+  const connection = await resolveWorker();
+  await verifyWorker(connection);
   let gpu;
   try {
-    gpu = await runRemote(
+    gpu = await remoteRunner(
       connection,
       "nvidia-smi",
       ["--query-gpu=name,memory.total,driver_version", "--format=csv,noheader"],
@@ -948,7 +957,7 @@ async function checkCaptureGpu() {
   if (!gpu.stdout.trim()) throw new CaptureWorkerError("capture-gpu-unavailable", "The capture worker returned no GPU details.");
   let renderer;
   try {
-    renderer = await runRemote(connection, "node", [`${REMOTE_ROOT}/check-gpu-renderer.mjs`], 60000);
+    renderer = await remoteRunner(connection, "node", [`${REMOTE_ROOT}/check-gpu-renderer.mjs`], 60000);
   } catch (error) {
     throw new CaptureWorkerError("capture-gpu-webgl-unavailable", "The capture worker WebGL check failed.", error instanceof Error ? error.message : String(error));
   }
@@ -1081,6 +1090,7 @@ export {
   isPrivateAddress,
   resolvePublicAddresses,
   resolveOutputDirectory,
+  resolveExistingAncestor,
   acquireCaptureLock,
   releaseCaptureLock,
   tools,
