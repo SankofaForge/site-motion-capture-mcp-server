@@ -236,6 +236,18 @@ test("stale lock owners can be reclaimed but live or malformed locks remain busy
   await mkdir(live);
   await writeFile(join(live, "owner.json"), JSON.stringify({ pid: 1, createdAt: Date.now(), token: "live" }));
   await assert.rejects(() => acquireCaptureLock(live), /capture_target_busy/);
+
+  const missingTimestamp = join(out, ".missing-timestamp.capture.lock");
+  await mkdir(missingTimestamp);
+  await writeFile(join(missingTimestamp, "owner.json"), JSON.stringify({ pid: 1, token: "old" }));
+  await assert.rejects(() => acquireCaptureLock(missingTimestamp), /capture_target_busy/);
+
+  const reclaimBusy = join(out, ".reclaim-busy.capture.lock");
+  await mkdir(reclaimBusy);
+  await mkdir(`${reclaimBusy}.reclaim`);
+  await assert.rejects(() => acquireCaptureLock(reclaimBusy), /capture_target_busy/);
+
+  await assert.rejects(() => acquireCaptureLock(join(out, "missing-parent", "lock")), { code: "ENOENT" });
 });
 
 test("capture lock cleanup removes failed owner writes and preserves other owners", async () => {
@@ -273,6 +285,14 @@ test("public DNS resolution sorts records and rejects empty or failed lookups", 
   await assert.rejects(
     () => resolvePublicAddresses("https://resolver.fixture.test", async () => { throw new Error("dns error"); }),
     /url host could not be resolved safely/
+  );
+  await assert.rejects(
+    () => resolvePublicAddresses("https://resolver.fixture.test", async () => []),
+    /url must resolve only to public IP addresses/
+  );
+  await assert.rejects(
+    () => resolvePublicAddresses("https://resolver.fixture.test", async () => [{ address: "127.0.0.1" }]),
+    /url must resolve only to public IP addresses/
   );
   await assert.rejects(
     () => assertPublicResolution("https://empty.fixture.test", async () => []),
@@ -1091,6 +1111,26 @@ else process.stdout.write("worker ready\\n");
       () => checkCaptureGpu({
         resolveWorker: async () => connection,
         verifyWorker,
+        remoteRunner: async () => ({ stdout: "" }),
+      }),
+      /returned no GPU details/
+    );
+    let emptyRendererCall = 0;
+    await assert.rejects(
+      () => checkCaptureGpu({
+        resolveWorker: async () => connection,
+        verifyWorker,
+        remoteRunner: async () => {
+          emptyRendererCall += 1;
+          return { stdout: emptyRendererCall === 1 ? "NVIDIA RTX fixture" : "" };
+        },
+      }),
+      /returned no Chromium WebGL renderer/
+    );
+    await assert.rejects(
+      () => checkCaptureGpu({
+        resolveWorker: async () => connection,
+        verifyWorker,
         remoteRunner: async () => { throw "GPU failure"; },
       }),
       (error) => error.reasonCode === "capture-gpu-unavailable" && error.diagnostic === "GPU failure"
@@ -1313,6 +1353,24 @@ test("resolveConnection vastai error and missing endpoint branches", async () =>
     process.env.PATH = prevPath;
     if (prevUrl !== undefined) process.env.SITE_MOTION_SSH_URL = prevUrl;
     if (prevInstance !== undefined) process.env.VAST_INSTANCE_ID = prevInstance; else delete process.env.VAST_INSTANCE_ID;
+  }
+});
+
+test("resolveConnection maps Vast CLI timeouts to the timeout reason", async () => {
+  const previousUrl = process.env.SITE_MOTION_SSH_URL;
+  const previousInstance = process.env.VAST_INSTANCE_ID;
+  delete process.env.SITE_MOTION_SSH_URL;
+  process.env.VAST_INSTANCE_ID = "timeout-instance";
+  try {
+    await assert.rejects(
+      () => resolveConnection(undefined, async () => ({ error: new Error("vastai timed out") })),
+      (error) => error.reasonCode === "capture-worker-timeout"
+    );
+  } finally {
+    if (previousUrl === undefined) delete process.env.SITE_MOTION_SSH_URL;
+    else process.env.SITE_MOTION_SSH_URL = previousUrl;
+    if (previousInstance === undefined) delete process.env.VAST_INSTANCE_ID;
+    else process.env.VAST_INSTANCE_ID = previousInstance;
   }
 });
 

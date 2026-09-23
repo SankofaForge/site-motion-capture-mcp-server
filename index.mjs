@@ -288,7 +288,7 @@ function connectionFingerprint(connection) {
   return createHash("sha256").update(identity).digest("hex");
 }
 
-async function resolveConnection(signal) {
+async function resolveConnection(signal, runCommand = run) {
   const configuration = workerConfiguration();
   if (!configuration) {
     throw new CaptureWorkerError(
@@ -298,7 +298,7 @@ async function resolveConnection(signal) {
   }
   if (configuration.source === "ssh-url") return parseSshUrl(configuration.sshUrl);
 
-  const result = await run("vastai", ["ssh-url", configuration.instanceId], { timeoutMs: WORKER_RESOLUTION_TIMEOUT_MS, signal });
+  const result = await runCommand("vastai", ["ssh-url", configuration.instanceId], { timeoutMs: WORKER_RESOLUTION_TIMEOUT_MS, signal });
   if (result.error) {
     const reasonCode = /timed out|timeout/i.test(result.error.message)
       ? "capture-worker-timeout"
