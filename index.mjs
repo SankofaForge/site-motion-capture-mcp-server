@@ -111,8 +111,6 @@ function writeMessage(message) {
 }
 
 function waitWithSignal(promise, signal) {
-  if (!signal) return promise;
-  if (signal.aborted) return Promise.reject(new Error("Capture was cancelled."));
   return new Promise((resolvePromise, rejectPromise) => {
     const onAbort = () => {
       signal.removeEventListener("abort", onAbort);
@@ -323,7 +321,7 @@ async function resolveConnection(signal, runCommand = run) {
     throw new CaptureWorkerError(
       "capture-worker-unavailable",
       "The configured Vast instance returned an invalid SSH endpoint.",
-      error instanceof Error ? error.message : String(error),
+      error.message,
     );
   }
 }
@@ -569,17 +567,17 @@ async function resolveOutputDirectory(outputDir, { pathRealpath = realpath } = {
   return resolvedOutput;
 }
 
-async function acquireCaptureLock(lockPath, { writeOwner = writeFile, removeLock = rm } = {}) {
+async function acquireCaptureLock(lockPath, { writeOwner = writeFile, removeLock = rm, makeDirectory = mkdir } = {}) {
   const owner = { pid: process.pid, createdAt: Date.now(), token: randomUUID() };
   let lockCreated = false;
   try {
-    await mkdir(lockPath);
+    await makeDirectory(lockPath);
     lockCreated = true;
   } catch (error) {
     if (error.code !== "EEXIST") throw error;
     const reclaimPath = `${lockPath}.reclaim`;
     try {
-      await mkdir(reclaimPath);
+      await makeDirectory(reclaimPath);
     } catch (reclaimError) {
       if (reclaimError.code === "EEXIST") throw new Error("capture_target_busy");
       throw reclaimError;
@@ -595,7 +593,7 @@ async function acquireCaptureLock(lockPath, { writeOwner = writeFile, removeLock
         throw new Error("capture_target_busy");
       }
       await rm(lockPath, { recursive: true, force: false });
-      await mkdir(lockPath);
+      await makeDirectory(lockPath);
       lockCreated = true;
     } finally {
       await rm(reclaimPath, { recursive: true, force: true });
@@ -673,10 +671,8 @@ async function captureSiteMotion(input) {
 }
 
 async function captureSiteMotionWithController(input, controller) {
-  if (controller.signal.aborted) throw new Error("Capture was cancelled.");
   const capture = validateCaptureInput(input);
   await waitWithSignal(assertPublicResolution(capture.url), controller.signal);
-  if (controller.signal.aborted) throw new Error("Capture was cancelled.");
   let connection;
   if (capture.gpu) {
     const check = capture.gpuCheckId ? gpuChecks.get(capture.gpuCheckId) : undefined;
@@ -787,7 +783,6 @@ async function captureSiteMotionWithController(input, controller) {
       validateJankReport(jankReport);
       const mediaValidation = await validateMedia(join(stageDir, `${capture.name}.webm`), controller.signal);
       if (mediaValidation.status === "blocked") throw new Error(`media validation failed: ${mediaValidation.reason}`);
-      if (controller.signal.aborted) throw new Error("Capture was cancelled.");
       await rename(join(stageDir, `${capture.name}.webm`), localVideo);
       await rename(join(stageDir, `${capture.name}.jank.json`), localJank);
       const localManifestData = {
@@ -814,7 +809,7 @@ async function captureSiteMotionWithController(input, controller) {
         await runRemote(connection, "rm", ["-rf", "--", remoteRunDir], 30000, controller.signal);
         cleanup = "confirmed";
       } catch (error) {
-        cleanupError = error instanceof Error ? error.message : String(error);
+        cleanupError = error.message;
         cleanup = "pending";
       }
     } catch (error) {
@@ -830,6 +825,8 @@ async function captureSiteMotionWithController(input, controller) {
     }
     const jankReport = JSON.parse(await readFile(localJank, "utf8"));
     const manifest = JSON.parse(await readFile(localManifest, "utf8"));
+    const videoFile = manifest.files.find((file) => file.path.endsWith(".webm"));
+    const jankFile = manifest.files.find((file) => file.path.endsWith(".jank.json"));
     manifest.cleanup = cleanup;
     if (cleanupError) {
       manifest.cleanupError = cleanupError;
@@ -846,7 +843,11 @@ async function captureSiteMotionWithController(input, controller) {
       modes: manifest.modes,
       worker: { ...workerIdentity(), remoteRunDir, recorder: manifest.recorder || null },
       consent: jankReport.consent || null,
-      artifacts: { video: { path: localVideo, size: manifest.files.find((f) => f.path.endsWith(".webm"))?.size, sha256: manifest.files.find((f) => f.path.endsWith(".webm"))?.sha256 }, jank: { path: localJank, size: manifest.files.find((f) => f.path.endsWith(".jank.json"))?.size, sha256: manifest.files.find((f) => f.path.endsWith(".jank.json"))?.sha256 }, manifest: { path: localManifest, size: (await stat(localManifest)).size } },
+      artifacts: {
+        video: { path: localVideo, size: videoFile.size, sha256: videoFile.sha256 },
+        jank: { path: localJank, size: jankFile.size, sha256: jankFile.sha256 },
+        manifest: { path: localManifest, size: (await stat(localManifest)).size },
+      },
       validation: manifest.validation,
       cleanup,
       ...(cleanupError ? { cleanupError } : {}),
@@ -900,11 +901,11 @@ function ipv6ToBigInt(address) {
   const left = head ? head.split(":").filter(Boolean) : [];
   const right = tail ? tail.split(":").filter(Boolean) : [];
   const groups = [...left, ...Array(8 - left.length - right.length).fill("0"), ...right];
-  return groups.reduce((value, group) => (value << 16n) + BigInt(parseInt(group || "0", 16)), 0n);
+  return groups.reduce((value, group) => (value << 16n) + BigInt(parseInt(group, 16)), 0n);
 }
 
 function inIpv6Range(value, base, bits) {
-  const mask = bits === 0 ? 0n : ((1n << BigInt(bits)) - 1n) << BigInt(128 - bits);
+  const mask = ((1n << BigInt(bits)) - 1n) << BigInt(128 - bits);
   return (value & mask) === (base & mask);
 }
 

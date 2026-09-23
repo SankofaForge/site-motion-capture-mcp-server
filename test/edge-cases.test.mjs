@@ -107,6 +107,68 @@ test("run() handles timeouts, stderr data, error events, signals, and exit codes
   assert.match(signalResult.error.message, /stopped with signal SIGTERM/);
 });
 
+test("run() bounds process output and falls back when process-group signaling fails", async () => {
+  const boundedResult = await run(process.execPath, [
+    "-e",
+    "process.stdout.write('a'.repeat(16384)); setTimeout(() => process.stdout.write('b'), 25);",
+  ]);
+  assert.equal(boundedResult.stdout.length, 16 * 1024);
+  assert.equal(boundedResult.stdout.includes("b"), false);
+
+  const controller = new AbortController();
+  controller.abort();
+  const cancelledResult = await run(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    signal: controller.signal,
+  });
+  assert.equal(cancelledResult.code, 124);
+  assert.match(cancelledResult.error.message, /was cancelled/);
+
+  const originalKill = process.kill;
+  const attemptedSignals = [];
+  process.kill = (_pid, signal) => {
+    attemptedSignals.push(signal);
+    throw new Error("process group is unavailable");
+  };
+  try {
+    const fallbackResult = await run(
+      process.execPath,
+      ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"],
+      { timeoutMs: 40, killDelayMs: 20 },
+    );
+    assert.equal(fallbackResult.code, 124);
+    assert.deepEqual(attemptedSignals, ["SIGTERM", "SIGKILL"]);
+  } finally {
+    process.kill = originalKill;
+  }
+});
+
+test("run() keeps the first cancellation when the timeout fires during shutdown", async () => {
+  const readyFile = join(await tempDir("run-shutdown-"), "ready");
+  const controller = new AbortController();
+  const running = run(
+    process.execPath,
+    ["-e", `process.on('SIGTERM', () => {}); require('node:fs').writeFileSync(${JSON.stringify(readyFile)}, 'ready'); setInterval(() => {}, 1000);`],
+    { timeoutMs: 500, killDelayMs: 750, signal: controller.signal },
+  );
+
+  let childReady = false;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    try {
+      await stat(readyFile);
+      childReady = true;
+      break;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  assert.equal(childReady, true);
+  controller.abort();
+
+  const result = await running;
+  assert.equal(result.code, 124);
+  assert.match(result.error.message, /was cancelled/);
+});
+
 test("trimOutput() trims and truncates diagnostics to a bounded size", () => {
   assert.equal(trimOutput("  hello world  "), "hello world");
   const longText = "a".repeat(4500);
@@ -120,24 +182,46 @@ test("public-resolution guards cover literal and DNS safety paths", async () => 
   assert.equal(isPrivateAddress("::1"), true);
   assert.equal(isPrivateAddress("203.0.113.10"), false);
   for (const address of [
+    "0.0.0.1",
     "10.0.0.1",
     "169.254.1.1",
     "192.168.1.1",
     "172.16.0.1",
     "172.31.255.254",
+    "100.127.255.254",
+    "192.0.0.1",
+    "192.0.2.1",
+    "192.88.99.1",
+    "198.19.255.254",
     "fc00::1",
     "fd12::1",
     "fe80::1",
     "::ffff:192.168.1.1",
+    "100::1",
     "100.64.0.1",
     "198.18.0.1",
     "224.0.0.1",
     "2001:db8::1",
+    "2001:10::1",
+    "ff00::1",
+    "2001:2::1",
   ]) {
     assert.equal(isPrivateAddress(address), true, address);
   }
+  assert.equal(isPrivateAddress("100.128.0.1"), false);
+  assert.equal(isPrivateAddress("172.32.0.1"), false);
+  assert.equal(isPrivateAddress("192.0.3.1"), false);
+  assert.equal(isPrivateAddress("192.88.98.1"), false);
+  assert.equal(isPrivateAddress("198.20.0.1"), false);
   assert.equal(isPrivateAddress("172.15.0.1"), false);
   assert.equal(isPrivateAddress("2001:db8::1"), true);
+  assert.equal(isPrivateAddress("::ffff:8.8.8.8"), false);
+  assert.equal(isPrivateAddress("2001:4860:4860::8888"), false);
+  assert.deepEqual(await resolvePublicAddresses("https://8.8.8.8/"), ["8.8.8.8"]);
+  await assert.rejects(
+    () => resolvePublicAddresses("https://192.0.2.1/"),
+    /url must resolve only to public IP addresses/
+  );
   await assert.rejects(() => assertPublicResolution("https://[::1]/"), /public IP/);
   await assert.rejects(
     () => assertPublicResolution("https://localhost/"),
@@ -242,10 +326,29 @@ test("stale lock owners can be reclaimed but live or malformed locks remain busy
   await writeFile(join(missingTimestamp, "owner.json"), JSON.stringify({ pid: 1, token: "old" }));
   await assert.rejects(() => acquireCaptureLock(missingTimestamp), /capture_target_busy/);
 
+  const malformed = join(out, ".malformed.capture.lock");
+  await mkdir(malformed);
+  await writeFile(join(malformed, "owner.json"), "{");
+  await assert.rejects(() => acquireCaptureLock(malformed), /capture_target_busy/);
+
   const reclaimBusy = join(out, ".reclaim-busy.capture.lock");
   await mkdir(reclaimBusy);
   await mkdir(`${reclaimBusy}.reclaim`);
   await assert.rejects(() => acquireCaptureLock(reclaimBusy), /capture_target_busy/);
+
+  let makeDirectoryCalls = 0;
+  const reclaimError = Object.assign(new Error("reclaim directory unavailable"), { code: "EACCES" });
+  await assert.rejects(
+    () => acquireCaptureLock(join(out, ".reclaim-failure.capture.lock"), {
+      makeDirectory: async () => {
+        makeDirectoryCalls += 1;
+        if (makeDirectoryCalls === 1) throw Object.assign(new Error("lock exists"), { code: "EEXIST" });
+        throw reclaimError;
+      },
+    }),
+    (error) => error === reclaimError
+  );
+  assert.equal(makeDirectoryCalls, 2);
 
   await assert.rejects(() => acquireCaptureLock(join(out, "missing-parent", "lock")), { code: "ENOENT" });
 });
@@ -375,6 +478,11 @@ test("parseSshUrl() parses URLs and handles default username and invalid formats
 
   // Missing port
   assert.throws(() => parseSshUrl("ssh://remote.host"), /The Vast SSH endpoint must use ssh:\/\/user@host:port/);
+
+  // Credentials and URL suffixes can change how an SSH endpoint is interpreted.
+  assert.throws(() => parseSshUrl("ssh://alice:secret@remote.host:2222"), /without credentials or query parameters/);
+  assert.throws(() => parseSshUrl("ssh://alice@remote.host:2222?command=whoami"), /without credentials or query parameters/);
+  assert.throws(() => parseSshUrl("ssh://alice@remote.host:2222#fragment"), /without credentials or query parameters/);
 });
 
 test("resolveConnection() requires an approved endpoint and supports Vast instance resolution", async () => {
@@ -386,6 +494,10 @@ test("resolveConnection() requires an approved endpoint and supports Vast instan
     delete process.env.SITE_MOTION_SSH_URL;
     delete process.env.VAST_INSTANCE_ID;
     await assert.rejects(() => resolveConnection(), /Capture worker is not configured/);
+
+    process.env.SITE_MOTION_SSH_URL = "   ";
+    await assert.rejects(() => resolveConnection(), /Capture worker is not configured/);
+    delete process.env.SITE_MOTION_SSH_URL;
 
     process.env.SITE_MOTION_SSH_URL = "ssh://alice@remote.host:2222";
     assert.deepEqual(await resolveConnection(), { user: "alice", host: "remote.host", port: "2222" });
@@ -886,6 +998,7 @@ if (dest.endsWith("manifest.json")) {
       gpu: true,
       gpu_check_id: gpuCheckId,
       mobile: true,
+      reduced_motion: true,
       no_scroll: true,
       consent_preflight: true,
       consent_selector: "#consent-btn",
@@ -898,6 +1011,23 @@ if (dest.endsWith("manifest.json")) {
     });
     const parsedFullReport = JSON.parse(resultFullOptions.content[0].text);
     assert.equal(parsedFullReport.cleanup, "confirmed");
+
+    const mismatchedCheck = await checkCaptureGpu();
+    const mismatchedCheckId = JSON.parse(mismatchedCheck.content[0].text).checkId;
+    const configuredUrl = process.env.SITE_MOTION_SSH_URL;
+    process.env.SITE_MOTION_SSH_URL = "ssh://root@different.example:22";
+    try {
+      await assert.rejects(() => captureSiteMotion({
+        url: "https://example.test",
+        name: "mismatched-gpu-check",
+        output_dir: out,
+        overwrite: true,
+        gpu: true,
+        gpu_check_id: mismatchedCheckId,
+      }), /must match the configured capture worker/);
+    } finally {
+      process.env.SITE_MOTION_SSH_URL = configuredUrl;
+    }
 
     await assert.rejects(() => captureSiteMotion({
       url: "https://example.test",
@@ -1107,6 +1237,21 @@ else process.stdout.write("worker ready\\n");
 
     const connection = { user: "root", host: "fixture.test", port: "22" };
     const verifyWorker = async () => {};
+    const previousInstance = process.env.VAST_INSTANCE_ID;
+    delete process.env.SITE_MOTION_SSH_URL;
+    delete process.env.VAST_INSTANCE_ID;
+    const configuredWorker = await checkCaptureGpu({
+      resolveWorker: async () => connection,
+      verifyWorker,
+      remoteRunner: async (_connection, command) => ({
+        stdout: command === "nvidia-smi" ? "NVIDIA RTX fixture" : "Chromium WebGL fixture",
+      }),
+    });
+    const configuredWorkerData = JSON.parse(configuredWorker.content[0].text);
+    assert.equal(configuredWorkerData.source, "unconfigured");
+    assert.equal(configuredWorkerData.instanceId, null);
+    if (previousInstance !== undefined) process.env.VAST_INSTANCE_ID = previousInstance;
+
     await assert.rejects(
       () => checkCaptureGpu({
         resolveWorker: async () => connection,
@@ -1259,6 +1404,9 @@ test("handleMessage() error formatting for Error instance vs non-Error values", 
   assert.equal(errRes.isError, true);
   assert.equal(errRes.structuredContent.reasonCode, "capture-error");
   assert.match(errRes.content[0].text, /custom-err/);
+
+  const diagnosticResult = errorResult("custom-err", "request failed", "remote diagnostic output");
+  assert.equal(diagnosticResult.structuredContent.diagnostic, "remote diagnostic output");
 });
 
 test("additional branch coverage for input parameters and http urls", () => {
@@ -1321,6 +1469,8 @@ test("additional branch coverage for input parameters and http urls", () => {
     "http://[fd00::1]/admin",
     "http://[fe80::1]/admin",
     "https://user:pass@example.test/",
+    "https://:pass@example.test/",
+    "https://192.168.1.1/",
   ]) {
     assert.throws(() => validateCaptureInput({ url }), /public HTTP\(S\) host without credentials/);
   }

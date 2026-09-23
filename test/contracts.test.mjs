@@ -114,6 +114,23 @@ test("validateMedia rejects a failing ffprobe process", async () => {
   finally { process.env.PATH = previousPath; if (previousContract === undefined) delete process.env.SITE_MOTION_FFPROBE; else process.env.SITE_MOTION_FFPROBE = previousContract; }
 });
 
+test("validateMedia stops when its capture signal is already aborted", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "site-motion-media-cancel-"));
+  const file = join(dir, "capture.webm");
+  const bin = await mkdtemp(join(tmpdir(), "site-motion-ffprobe-pending-"));
+  await writeFile(file, "fixture");
+  await writeExecutable(bin, "ffprobe", "setInterval(() => {}, 1000);");
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${bin}:${previousPath}`;
+  const controller = new AbortController();
+  controller.abort();
+  try {
+    await assert.rejects(() => validateMedia(file, controller.signal), /Capture was cancelled/);
+  } finally {
+    process.env.PATH = previousPath;
+  }
+});
+
 test("structured capture response retains legacy artifact paths", async () => {
   const source = await readFile(new URL("../index.mjs", import.meta.url), "utf8");
   assert.match(source, /structuredContent:/);

@@ -52,7 +52,7 @@ else fs.writeFileSync(dest, "webm");
 `);
   const replies = await server([{ jsonrpc: "2.0", id: 8, method: "tools/call", params: {
     name: "capture_site_motion", arguments: { url: "https://example.test", name: "forwarded", output_dir: out,
-      consent_mode: "none", consent_selector: "#custom", scroll_distance: 7, scroll_step: 3, auto_discover: true, gpu: false },
+      consent_mode: "none", consent_selector: "#custom", scroll_distance: 7, scroll_step: 3, auto_discover: true, reduced_motion: true, gpu: false },
   } }], { PATH: `${bin}:${process.env.PATH}`, SITE_MOTION_SSH_URL: "ssh://root@fixture.test:22" });
   assert.equal(replies[0].id, 8);
   assert.equal(replies[0].result.content[0].type, "text");
@@ -62,6 +62,7 @@ else fs.writeFileSync(dest, "webm");
   assert.match(callsText, /'--scroll-distance' '7'/);
   assert.match(callsText, /'--scroll-step' '3'/);
   assert.match(callsText, /'--auto-discover'/);
+  assert.match(callsText, /'--reduced-motion'/);
   assert.match(callsText, /--consent-budget-ms' '8000'/);
 });
 
