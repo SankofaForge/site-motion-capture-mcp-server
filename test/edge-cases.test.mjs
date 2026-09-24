@@ -1029,7 +1029,40 @@ if (dest.endsWith("manifest.json")) {
       reduced_motion: true,
     }), /fresh GPU check/);
 
+    // A fresh GPU check, verified evidence, and confirmed cleanup complete a mobile cell.
+    await writeExecutable(bin, "scp", captureCellShimSource({
+      name: "gpu-complete", mobile: true, reducedMotion: true, consentMode: "granular",
+    }));
+    const gpuCheck = await checkCaptureGpu();
+    const gpuCheckId = JSON.parse(gpuCheck.content[0].text).checkId;
+    const completed = await captureSiteMotion({
+      url: "https://example.test",
+      name: "gpu-complete",
+      output_dir: out,
+      gpu: true,
+      gpu_check_id: gpuCheckId,
+      mobile: true,
+      reduced_motion: true,
+      consent_mode: "granular",
+      consent_settings_selector: "#settings",
+      consent_optional_selector: "#optional",
+      consent_save_selector: "#save",
+    });
+    const completedReport = JSON.parse(completed.content[0].text);
+    assert.equal(completedReport.status, "complete");
+    assert.equal(completedReport.cleanup, "confirmed");
+    assert.equal(completedReport.consent.mode, "granular");
+    assert.deepEqual(completedReport.viewport, { width: 390, height: 844, mobile: true, reducedMotion: true });
+    await assert.rejects(() => captureSiteMotion({
+      url: "https://example.test",
+      name: "gpu-check-reuse",
+      output_dir: out,
+      gpu: true,
+      gpu_check_id: gpuCheckId,
+    }), /fresh GPU check/);
+
     // A transferred but unverified video is rejected before local promotion.
+    await writeExecutable(bin, "scp", captureCellShimSource({ name: "partial", jankStatus: "partial" }));
     await writeExecutable(bin, "ffprobe", "process.exit(1);");
     await assert.rejects(
       async () => captureSiteMotion({ url: "https://example.test", name: "partial", output_dir: out, overwrite: true }),

@@ -18,6 +18,7 @@ const REMOTE_OUTPUT = process.env.SITE_MOTION_REMOTE_OUTPUT || `${REMOTE_ROOT}/o
 const DEFAULT_LOCAL_OUTPUT =
   process.env.SITE_MOTION_OUTPUT_DIR ||
   join(process.cwd(), "artifacts", "design-inspiration", "site-motion-capture");
+const LONG_TASK_THRESHOLD_MS = 50;
 const GPU_CHECK_TTL_MS = 120_000;
 const CAPTURE_LOCK_TTL_MS = 30 * 60 * 1000;
 const MAX_PROCESS_OUTPUT_BYTES = 16 * 1024;
@@ -264,7 +265,7 @@ function validateJankReport(jankReport, expected = undefined) {
   const valid = jankReport && typeof jankReport === "object" && !Array.isArray(jankReport)
     && jankReport.schemaVersion === "jank-report.v1"
     && ["valid", "partial"].includes(jankReport.status)
-    && typeof jankReport.finalUrl === "string"
+    && typeof jankReport.finalUrl === "string" && jankReport.finalUrl.length > 0
     && Array.isArray(jankReport.longTasks)
     && Number.isInteger(jankReport.longTaskCount)
     && jankReport.longTaskCount === jankReport.longTasks.length
@@ -873,7 +874,7 @@ async function captureSiteMotionWithController(input, controller) {
       try {
         remote = await runRemoteCommand(connection, remoteCommand, capture.timeoutMs, remoteRunDir, controller.signal);
       } catch (error) {
-        const diagnostic = error instanceof Error ? error.message : String(error);
+        const diagnostic = String(error);
         if (/capture egress boundary/i.test(diagnostic)) {
           throw new CaptureWorkerError("capture-egress-unverified", "The runner egress boundary could not be verified for this capture.", diagnostic);
         }
@@ -924,7 +925,7 @@ async function captureSiteMotionWithController(input, controller) {
         contractVersion: CONTRACT_VERSION,
         cellId: `${capture.mobile ? "mobile" : "desktop"}-${capture.reducedMotion ? "reduced" : "full"}`,
         url: capture.url,
-        finalUrl: jankReport.finalUrl || capture.url,
+        finalUrl: jankReport.finalUrl,
         viewport: manifest.viewport,
         modes: { gpu: capture.gpu, scroll: !capture.noScroll },
         validation: { media: mediaValidation, jank: { status: jankReport.status } },
@@ -934,9 +935,9 @@ async function captureSiteMotionWithController(input, controller) {
           gpu: { status: capture.gpu ? "verified" : "unverified" },
           egress: egressEvidence,
           egressAttestation: manifest.egressAttestation,
-          consent: jankReport.consent || null,
-          interactionFailures: jankReport.interactionFailures || [],
-          scroll: jankReport.scroll || null,
+          consent: jankReport.consent,
+          interactionFailures: jankReport.interactionFailures,
+          scroll: jankReport.scroll,
         },
       };
       await writeFile(localManifest, JSON.stringify(localManifestData, null, 2));
@@ -983,7 +984,7 @@ async function captureSiteMotionWithController(input, controller) {
       viewport: manifest.viewport,
       modes: manifest.modes,
       worker: { ...workerIdentity(), remoteRunDir, recorder: manifest.recorder || null },
-      consent: jankReport.consent || null,
+      consent: jankReport.consent,
       egress: manifest.evidence.egress,
       artifacts: {
         video: { path: localVideo, size: videoFile.size, sha256: videoFile.sha256 },
