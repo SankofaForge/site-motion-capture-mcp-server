@@ -40,6 +40,7 @@ import {
   workerPreflightError,
 } from "../index.mjs";
 import { tempDir, shimBin, writeExecutable } from "./fixtures.mjs";
+import { captureCellShimSource } from "./capture-cell-fixtures.mjs";
 
 function captureSiteMotion(input) {
   return rawCaptureSiteMotion({ gpu: false, ...input });
@@ -665,7 +666,7 @@ test("validateCaptureInput() default name and all parameter validations", () => 
 test("captureSiteMotion() file exist / lock error / manifest edge cases", async () => {
   const bin = await shimBin();
   const out = await tempDir("edge-capture-");
-  await writeExecutable(bin, "ffprobe", `process.stdout.write(JSON.stringify({ format: { format_name: "matroska,webm", duration: "1.0" } }));`);
+  await writeExecutable(bin, "ffprobe", `process.stdout.write(JSON.stringify({ format: { format_name: "matroska,webm", duration: "1.0" }, streams: [{ codec_type: "video" }] }));`);
   const prevPath = process.env.PATH;
   const prevUrl = process.env.SITE_MOTION_SSH_URL;
   process.env.PATH = `${bin}:${process.env.PATH}`;
@@ -945,35 +946,9 @@ if (dest.endsWith("manifest.json")) {
       /manifest validation failed for bad-hash\.webm/
     );
 
-    // Successful capture with absent consent in jank report -> defaults to consent: null
-    const videoData = Buffer.from("video-bytes");
-    const jankStr = JSON.stringify({ noConsentField: true, status: "valid" });
-    const jankData = Buffer.from(jankStr);
-    await writeExecutable(
-      bin,
-      "scp",
-      `
-const fs = require("node:fs");
-const crypto = require("node:crypto");
-const dest = process.argv.at(-1);
-const stageDir = require("node:path").dirname(dest);
-const runId = stageDir.replace(/^.*\\.capture-/, "");
-if (dest.endsWith("manifest.json")) {
-  fs.writeFileSync(dest, JSON.stringify({
-    runId,
-    files: [
-      { path: "no-consent.webm", size: ${videoData.length}, sha256: crypto.createHash("sha256").update(Buffer.from("video-bytes")).digest("hex") },
-      { path: "no-consent.jank.json", size: ${jankData.length}, sha256: crypto.createHash("sha256").update(Buffer.from(${JSON.stringify(jankStr)})).digest("hex") },
-    ]
-  }));
-} else if (dest.endsWith(".webm")) {
-  fs.writeFileSync(dest, Buffer.from("video-bytes"));
-} else if (dest.endsWith(".jank.json")) {
-  fs.writeFileSync(dest, Buffer.from(${JSON.stringify(jankStr)}));
-}
-`
-    );
-    const resultNoConsent = await captureSiteMotion({
+    // Legacy manifests with no capture-cell.v2 evidence must be blocked.
+    await writeExecutable(bin, "scp", captureCellShimSource({ name: "no-consent", consentMode: "none" }).replace('"contractVersion":"capture-cell.v2"', '"contractVersion":"capture-cell.v1"'));
+    await assert.rejects(() => captureSiteMotion({
       url: "https://example.test",
       name: "no-consent",
       output_dir: out,
@@ -982,21 +957,16 @@ if (dest.endsWith("manifest.json")) {
       mobile: false,
       no_scroll: false,
       consent_preflight: false,
-    });
-    const parsedReport = JSON.parse(resultNoConsent.content[0].text);
-    assert.equal(parsedReport.consent, null);
-    assert.equal(parsedReport.cleanup, "confirmed");
+    }), /unsupported contract version/);
 
-    // Successful capture covering mobile, no-scroll, selectors, and consent accept approved
-    const gpuCheck = await checkCaptureGpu();
-    const gpuCheckId = JSON.parse(gpuCheck.content[0].text).checkId;
-    const resultFullOptions = await captureSiteMotion({
+    // A complete-looking legacy fixture is still blocked without v2 evidence.
+    await writeExecutable(bin, "scp", captureCellShimSource({ name: "no-consent", mobile: true, reducedMotion: true, consentMode: "accept" }).replace('"contractVersion":"capture-cell.v2"', '"contractVersion":"capture-cell.v1"'));
+    await assert.rejects(() => captureSiteMotion({
       url: "https://example.test",
       name: "no-consent",
       output_dir: out,
       overwrite: true,
-      gpu: true,
-      gpu_check_id: gpuCheckId,
+      gpu: false,
       mobile: true,
       reduced_motion: true,
       no_scroll: true,
@@ -1008,9 +978,7 @@ if (dest.endsWith("manifest.json")) {
       hover_selector: "#hover-target",
       click_selector: "#click-target",
       consent_accept_approved: true,
-    });
-    const parsedFullReport = JSON.parse(resultFullOptions.content[0].text);
-    assert.equal(parsedFullReport.cleanup, "confirmed");
+    }), /unsupported contract version/);
 
     const mismatchedCheck = await checkCaptureGpu();
     const mismatchedCheckId = JSON.parse(mismatchedCheck.content[0].text).checkId;
@@ -1038,31 +1006,8 @@ if (dest.endsWith("manifest.json")) {
       gpu_check_id: "stale-gpu-check",
     }), /fresh GPU check/);
 
-    // A valid capture can still be partial when the recorder reports degraded status.
-    const partialJank = JSON.stringify({ status: "partial", finalUrl: "https://final.example", interactionFailures: [] });
-    await writeExecutable(
-      bin,
-      "scp",
-      `
-const fs = require("node:fs");
-const crypto = require("node:crypto");
-const dest = process.argv.at(-1);
-const stageDir = require("node:path").dirname(dest);
-const runId = stageDir.replace(/^.*\\.capture-/, "");
-if (dest.endsWith("manifest.json")) {
-  const video = Buffer.from("partial-video");
-  const jank = Buffer.from(${JSON.stringify(partialJank)});
-  fs.writeFileSync(dest, JSON.stringify({ runId, files: [
-    { path: "partial.webm", size: video.length, sha256: crypto.createHash("sha256").update(video).digest("hex") },
-    { path: "partial.jank.json", size: jank.length, sha256: crypto.createHash("sha256").update(jank).digest("hex") },
-  ] }));
-} else if (dest.endsWith(".webm")) {
-  fs.writeFileSync(dest, "partial-video");
-} else {
-  fs.writeFileSync(dest, ${JSON.stringify(partialJank)});
-}
-`
-    );
+    // A valid evidence envelope with degraded scroll remains partial.
+    await writeExecutable(bin, "scp", captureCellShimSource({ name: "partial", jankStatus: "partial" }));
     const partialResult = await captureSiteMotion({
       url: "https://example.test",
       name: "partial",
@@ -1071,7 +1016,7 @@ if (dest.endsWith("manifest.json")) {
     });
     const partialReport = JSON.parse(partialResult.content[0].text);
     assert.equal(partialReport.status, "partial");
-    assert.equal(partialReport.finalUrl, "https://final.example");
+    assert.equal(partialReport.finalUrl, "https://example.test/");
     assert.deepEqual(partialReport.viewport, { width: 1920, height: 1080, mobile: false, reducedMotion: false });
 
     await assert.rejects(() => captureSiteMotion({

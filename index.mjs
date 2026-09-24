@@ -88,7 +88,7 @@ const tools = [
         hover_selector: { type: "string", description: "A CSS selector to hover during the capture." },
         click_selector: { type: "string", description: "A CSS selector to click during the capture." },
         auto_discover: { type: "boolean", default: false, description: "Discover and exercise likely interactive controls." },
-        mobile: { type: "boolean", default: false },
+        mobile: { type: "boolean", default: false, description: "Emulate a mobile device with touch at a 390×844 viewport." },
         reduced_motion: { type: "boolean", default: false, description: "Emulate prefers-reduced-motion during recording." },
         no_scroll: { type: "boolean", default: false },
         gpu: { type: "boolean", default: true },
@@ -238,31 +238,118 @@ async function validateMedia(filePath, signal) {
   const info = await stat(filePath);
   if (info.size === 0) return { status: "blocked", reason: "zero-byte WebM" };
   // SITE_MOTION_FFPROBE is intentionally ignored: complete evidence always requires validation.
-  const probe = await run("ffprobe", ["-v", "error", "-show_entries", "format=format_name,duration", "-of", "json", filePath], { timeoutMs: 10000, signal });
+  const probe = await run("ffprobe", ["-v", "error", "-show_entries", "format=format_name,duration:stream=codec_type", "-of", "json", filePath], { timeoutMs: 10000, signal });
   if (signal?.aborted) throw new Error("Capture was cancelled.");
   if (probe.error && /ENOENT|not found/i.test(probe.error.message)) {
     return { status: "blocked", reason: "ffprobe is unavailable" };
   }
   if (probe.error || !probe.stdout.trim()) return { status: "blocked", reason: "ffprobe rejected the WebM" };
   try {
-    const format = JSON.parse(probe.stdout).format;
+    const probeData = JSON.parse(probe.stdout);
+    const format = probeData.format;
     const duration = Number(format?.duration);
-    if (!format?.format_name || !Number.isFinite(duration) || duration <= 0) return { status: "blocked", reason: "ffprobe returned no positive duration" };
-    return { status: "valid", format: format.format_name, durationSeconds: duration };
+    if (!String(format?.format_name || "").toLowerCase().includes("webm")) return { status: "blocked", reason: "ffprobe did not identify WebM format" };
+    if (!Number.isFinite(duration) || duration <= 0) return { status: "blocked", reason: "ffprobe returned no positive duration" };
+    const videoStreamCount = Array.isArray(probeData.streams)
+      ? probeData.streams.filter((stream) => stream?.codec_type === "video").length
+      : 0;
+    if (videoStreamCount < 1) return { status: "blocked", reason: "ffprobe found no video stream" };
+    return { status: "valid", format: format.format_name, durationSeconds: duration, videoStreamCount };
   } catch {
     return { status: "blocked", reason: "ffprobe returned invalid JSON" };
   }
 }
 
-function validateJankReport(jankReport) {
-  if (!jankReport || typeof jankReport !== "object") throw new Error("jank validation failed");
-  if (jankReport.longTaskCount !== undefined && (!Number.isInteger(jankReport.longTaskCount) || jankReport.longTaskCount < 0)) {
-    throw new Error("jank validation failed");
-  }
-  if (jankReport.longTasks !== undefined && !Array.isArray(jankReport.longTasks)) {
-    throw new Error("jank validation failed");
+function validateJankReport(jankReport, expected = undefined) {
+  const valid = jankReport && typeof jankReport === "object" && !Array.isArray(jankReport)
+    && jankReport.schemaVersion === "jank-report.v1"
+    && ["valid", "partial"].includes(jankReport.status)
+    && typeof jankReport.finalUrl === "string"
+    && Array.isArray(jankReport.longTasks)
+    && Number.isInteger(jankReport.longTaskCount)
+    && jankReport.longTaskCount === jankReport.longTasks.length
+    && Number.isFinite(jankReport.totalBlockingTimeMs) && jankReport.totalBlockingTimeMs >= 0
+    && Number.isFinite(jankReport.thresholdMs) && jankReport.thresholdMs >= 0
+    && typeof jankReport.choppy === "boolean"
+    && jankReport.byPhase && typeof jankReport.byPhase === "object" && !Array.isArray(jankReport.byPhase)
+    && (jankReport.observerError === null || typeof jankReport.observerError === "string")
+    && jankReport.longTasks.every((task) => task && Number.isFinite(task.startTime) && task.startTime >= 0
+      && Number.isFinite(task.duration) && task.duration >= LONG_TASK_THRESHOLD_MS
+      && typeof task.documentUrl === "string")
+    && jankReport.consent && typeof jankReport.consent === "object"
+    && ["reject", "accept", "none", "granular"].includes(jankReport.consent.mode)
+    && typeof jankReport.consent.verified === "boolean"
+    && typeof jankReport.consent.dismissed === "boolean"
+    && typeof jankReport.consent.actionTaken === "boolean"
+    && Array.isArray(jankReport.consent.blindSpots)
+    && !(jankReport.consent.mode === "none" && (jankReport.consent.actionTaken === true || jankReport.consent.dismissed === true))
+    && jankReport.scroll && typeof jankReport.scroll === "object"
+    && typeof jankReport.scroll.requested === "boolean"
+    && typeof jankReport.scroll.completed === "boolean"
+    && typeof jankReport.scroll.timedOut === "boolean"
+    && typeof jankReport.scroll.truncated === "boolean"
+    && Number.isFinite(jankReport.scroll.actualDistance) && jankReport.scroll.actualDistance >= 0
+    && Number.isFinite(jankReport.scroll.completedDistance) && jankReport.scroll.completedDistance >= 0
+    && Array.isArray(jankReport.interactionFailures)
+    && Array.isArray(jankReport.interactions)
+    && jankReport.viewport && typeof jankReport.viewport === "object"
+    && Number.isInteger(jankReport.viewport.width) && Number.isInteger(jankReport.viewport.height)
+    && typeof jankReport.viewport.mobile === "boolean"
+    && typeof jankReport.viewport.reducedMotion === "boolean";
+  if (!valid) throw new Error("jank validation failed");
+  if (jankReport.status === "valid" && (jankReport.consent.verified !== true
+    || jankReport.consent.blindSpots.length !== 0
+    || jankReport.scroll.completed !== true || jankReport.scroll.truncated !== false
+    || jankReport.interactionFailures.length !== 0
+    || jankReport.interactions.some((interaction) => interaction?.status === "failed")
+    || jankReport.observerError !== null)) throw new Error("jank validation failed: valid status contradicts report evidence");
+  if (expected) {
+    const viewport = jankReport.viewport;
+    if (viewport.width !== expected.width || viewport.height !== expected.height
+      || viewport.mobile !== expected.mobile || viewport.reducedMotion !== expected.reducedMotion) {
+      throw new Error("jank validation failed: requested viewport mismatch");
+    }
+    if (typeof expected.finalUrl === "string" && jankReport.finalUrl !== expected.finalUrl) {
+      throw new Error("jank validation failed: final URL mismatch");
+    }
   }
   return jankReport;
+}
+
+function validateEgressEvidence(evidence, expectedUrl, attestation) {
+  const expectedHost = new URL(expectedUrl).hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+  const namespaceInode = evidence?.networkNamespaceInode;
+  if (!evidence || evidence.status !== "verified"
+    || typeof evidence.boundaryId !== "string" || evidence.boundaryId.length === 0
+    || evidence.directEgressBlocked !== true
+    || evidence.proxyPolicy !== "capture-exact-host.v1"
+    || evidence.approvedProxyProbe !== true
+    || evidence.approvedHost !== expectedHost
+    || !Number.isSafeInteger(namespaceInode) || namespaceInode <= 0) {
+    throw new Error("egress validation failed: runner boundary is not verified for this capture host");
+  }
+  const timestampPattern = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+  const checkedAt = typeof attestation?.checkedAt === "string" && timestampPattern.test(attestation.checkedAt) ? Date.parse(attestation.checkedAt) : NaN;
+  const expiresAt = typeof attestation?.expiresAt === "string" && timestampPattern.test(attestation.expiresAt) ? Date.parse(attestation.expiresAt) : NaN;
+  const expectedFields = ["schemaVersion", "boundaryId", "checkedAt", "expiresAt", "runnerInstanceId", "browserExecutable", "browserVersion", "captureRuntime", "captureRuntimeVersion", "browserUseVersion", "approvedHost", "directEgressBlocked", "proxyPolicy", "networkNamespaceInode", "controls"];
+  const exactShape = attestation && typeof attestation === "object" && !Array.isArray(attestation)
+    && Object.keys(attestation).length === expectedFields.length
+    && expectedFields.every((key) => Object.hasOwn(attestation, key));
+  if (!exactShape
+    || attestation.schemaVersion !== "runner-egress-boundary.v1"
+    || attestation.boundaryId !== evidence.boundaryId
+    || attestation.approvedHost !== expectedHost
+    || attestation.networkNamespaceInode !== namespaceInode
+    || attestation.directEgressBlocked !== true
+    || attestation.proxyPolicy !== "capture-exact-host.v1"
+    || attestation.captureRuntime !== "site-motion-capture"
+    || !["runnerInstanceId", "browserExecutable", "browserVersion", "captureRuntimeVersion", "browserUseVersion"].every((key) => typeof attestation[key] === "string" && attestation[key].length > 0)
+    || !Number.isFinite(checkedAt) || !Number.isFinite(expiresAt) || expiresAt <= checkedAt || expiresAt - checkedAt > 120_000
+    || attestation.controls?.direct?.status !== "blocked"
+    || attestation.controls?.proxied?.status !== "passed") {
+    throw new Error("egress validation failed: full runner attestation is missing or mismatched");
+  }
+  return evidence;
 }
 
 function workerConfiguration() {
@@ -374,7 +461,26 @@ async function runRemoteCommand(connection, command, timeoutMs, runDir, signal) 
     let cleanup = "not-attempted";
     if (isSafeRemoteRunDir(runDir)) {
       try {
-        await runRemote(connection, "sh", ["-c", `if test -s ${shellQuote(`${runDir}/pid`)}; then kill -TERM $(cat ${shellQuote(`${runDir}/pid`)}) 2>/dev/null || true; fi; test ! -s ${shellQuote(`${runDir}/pid`)}`], 10000);
+        const terminate = [
+          "set -eu",
+          `pidfile=${shellQuote(`${runDir}/pid`)}`,
+          "if test -s \"$pidfile\"; then",
+          "  pid=$(cat \"$pidfile\")",
+          "  case \"$pid\" in ''|*[!0-9]*) exit 1 ;; esac",
+          "  cmdline=$(tr '\\000' ' ' < \"/proc/$pid/cmdline\")",
+          `  case "$cmdline" in *capture.mjs*${basename(runDir)}*) ;; *) exit 1 ;; esac`,
+          "  kill -TERM \"$pid\" 2>/dev/null || true",
+          "  i=0",
+          "  while kill -0 \"$pid\" 2>/dev/null && test \"$i\" -lt 25; do sleep 0.2; i=$((i + 1)); done",
+          "  if kill -0 \"$pid\" 2>/dev/null; then kill -KILL \"$pid\" 2>/dev/null || true; fi",
+          "  i=0",
+          "  while kill -0 \"$pid\" 2>/dev/null && test \"$i\" -lt 25; do sleep 0.2; i=$((i + 1)); done",
+          "  if kill -0 \"$pid\" 2>/dev/null; then exit 1; fi",
+          "  rm -f \"$pidfile\"",
+          "fi",
+          `test ! -s ${shellQuote(`${runDir}/pid`)}`,
+        ].join("\n");
+        await runRemote(connection, "sh", ["-c", terminate], 15000);
         cleanup = "confirmed";
       } catch {
         cleanup = "pending";
@@ -483,10 +589,13 @@ function validateCaptureInput(input) {
   if (consentMode === "accept" && consentAcceptApproved !== true) {
     throw new Error("accept consent_mode requires explicit consent_accept_approved=true.");
   }
+  const mobile = booleanOption(input, "mobile", false);
+  const width = integerOption(input, "width", 1920, 320, 3840);
+  const height = integerOption(input, "height", 1080, 240, 2160);
   return {
     url: url.href,
-    width: integerOption(input, "width", 1920, 320, 3840),
-    height: integerOption(input, "height", 1080, 240, 2160),
+    width: mobile ? 390 : width,
+    height: mobile ? 844 : height,
     name,
     outputDir,
     settleMs: integerOption(input, "settle_ms", 2000, 0, 30000),
@@ -507,7 +616,7 @@ function validateCaptureInput(input) {
     consentMaxClicks: integerOption(input, "consent_max_clicks", 6, 1, 12),
     consentWaitMs: integerOption(input, "consent_wait_ms", 1200, 0, 10000),
     consentPreflight: booleanOption(input, "consent_preflight", true),
-    mobile: booleanOption(input, "mobile", false),
+    mobile,
     reducedMotion: booleanOption(input, "reduced_motion", false),
     noScroll: booleanOption(input, "no_scroll", false),
     gpu: booleanOption(input, "gpu", true),
@@ -755,20 +864,29 @@ async function captureSiteMotionWithController(input, controller) {
     remoteArgs.push("--expected-addresses", JSON.stringify(expectedAddresses));
 
     if (capture.consentAcceptApproved) remoteArgs.push("--consent-accept-approved");
-    const remoteCommand = `set -eu; mkdir -p ${shellQuote(remoteRunDir)}; echo $$ > ${shellQuote(`${remoteRunDir}/pid`)}; trap 'rm -f ${shellQuote(`${remoteRunDir}/pid`)}' EXIT; exec ${["node", ...remoteArgs].map(shellQuote).join(" ")}`;
+    const remoteCommand = `set -eu; mkdir -p ${shellQuote(remoteRunDir)}; node ${remoteArgs.map(shellQuote).join(" ")} & worker_pid=$!; printf '%s\\n' "$worker_pid" > ${shellQuote(`${remoteRunDir}/pid`)}; set +e; wait "$worker_pid"; worker_status=$?; rm -f ${shellQuote(`${remoteRunDir}/pid`)}; exit "$worker_status"`;
     const stageDir = join(capture.outputDir, `.capture-${runId}`);
     let remote;
     let cleanup = "pending";
     let cleanupError = null;
     try {
-      remote = await runRemoteCommand(connection, remoteCommand, capture.timeoutMs, remoteRunDir, controller.signal);
+      try {
+        remote = await runRemoteCommand(connection, remoteCommand, capture.timeoutMs, remoteRunDir, controller.signal);
+      } catch (error) {
+        const diagnostic = error instanceof Error ? error.message : String(error);
+        if (/capture egress boundary/i.test(diagnostic)) {
+          throw new CaptureWorkerError("capture-egress-unverified", "The runner egress boundary could not be verified for this capture.", diagnostic);
+        }
+        throw error;
+      }
       await mkdir(stageDir, { recursive: true });
       await copyRemote(connection, remoteManifest, join(stageDir, "manifest.json"), 60000, controller.signal);
       await copyRemote(connection, remoteVideo, join(stageDir, `${capture.name}.webm`), 60000, controller.signal);
       await copyRemote(connection, remoteJank, join(stageDir, `${capture.name}.jank.json`), 60000, controller.signal);
       const manifest = JSON.parse(await readFile(join(stageDir, "manifest.json"), "utf8"));
       const expectedNames = new Set([`${capture.name}.webm`, `${capture.name}.jank.json`]);
-      if (manifest.runId !== runId || !Array.isArray(manifest.files) || manifest.files.length !== expectedNames.size) throw new Error("manifest validation failed");
+      if (manifest.runId !== runId || !Array.isArray(manifest.files)
+        || manifest.files.length !== expectedNames.size) throw new Error("manifest validation failed");
       const seenNames = new Set();
       for (const file of manifest.files) {
         if (!file || typeof file.path !== "string" || basename(file.path) !== file.path || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$/.test(file.path) || !expectedNames.has(file.path) || seenNames.has(file.path)) throw new Error("manifest validation failed");
@@ -778,8 +896,25 @@ async function captureSiteMotionWithController(input, controller) {
         const info = await stat(path);
         if (info.size === 0 || info.size !== file.size || createHash("sha256").update(bytes).digest("hex") !== file.sha256) throw new Error(`manifest validation failed for ${file.path}`);
       }
+      if (manifest.contractVersion !== CONTRACT_VERSION) throw new Error("manifest validation failed: unsupported contract version");
       const jankReport = JSON.parse(await readFile(join(stageDir, `${capture.name}.jank.json`), "utf8"));
-      validateJankReport(jankReport);
+      const expectedViewport = {
+        width: capture.width,
+        height: capture.height,
+        mobile: capture.mobile,
+        reducedMotion: capture.reducedMotion,
+      };
+      if (!manifest.viewport || Object.entries(expectedViewport).some(([key, value]) => manifest.viewport[key] !== value)) {
+        throw new Error("capture manifest validation failed: requested viewport mismatch");
+      }
+      if (typeof manifest.finalUrl !== "string" || manifest.finalUrl !== jankReport.finalUrl) {
+        throw new Error("capture manifest validation failed: final URL mismatch");
+      }
+      const egressEvidence = validateEgressEvidence(manifest.egress, capture.url, manifest.egressAttestation);
+      validateJankReport(jankReport, {
+        ...expectedViewport,
+        finalUrl: manifest.finalUrl,
+      });
       const mediaValidation = await validateMedia(join(stageDir, `${capture.name}.webm`), controller.signal);
       if (mediaValidation.status === "blocked") throw new Error(`media validation failed: ${mediaValidation.reason}`);
       await rename(join(stageDir, `${capture.name}.webm`), localVideo);
@@ -790,13 +925,15 @@ async function captureSiteMotionWithController(input, controller) {
         cellId: `${capture.mobile ? "mobile" : "desktop"}-${capture.reducedMotion ? "reduced" : "full"}`,
         url: capture.url,
         finalUrl: jankReport.finalUrl || capture.url,
-        viewport: manifest.viewport || { width: capture.width, height: capture.height, mobile: capture.mobile, reducedMotion: capture.reducedMotion },
+        viewport: manifest.viewport,
         modes: { gpu: capture.gpu, scroll: !capture.noScroll },
-        validation: { media: mediaValidation, jank: { status: "valid" } },
+        validation: { media: mediaValidation, jank: { status: jankReport.status } },
         cleanup: "pending",
-        status: [mediaValidation.status === "valid", jankReport.status === "valid"].every(Boolean) ? "complete" : "partial",
+        status: "partial",
         evidence: {
-          gpu: { status: "verified" },
+          gpu: { status: capture.gpu ? "verified" : "unverified" },
+          egress: egressEvidence,
+          egressAttestation: manifest.egressAttestation,
           consent: jankReport.consent || null,
           interactionFailures: jankReport.interactionFailures || [],
           scroll: jankReport.scroll || null,
@@ -811,9 +948,7 @@ async function captureSiteMotionWithController(input, controller) {
         cleanup = "pending";
       }
     } catch (error) {
-      await Promise.allSettled([
-        runRemote(connection, "rm", ["-rf", "--", remoteRunDir], 30000),
-      ]);
+      // Keep the remote run directory when process exit or evidence validation is uncertain.
       throw error;
     } finally {
       await rm(stageDir, { recursive: true, force: true });
@@ -823,10 +958,21 @@ async function captureSiteMotionWithController(input, controller) {
     const videoFile = manifest.files.find((file) => file.path.endsWith(".webm"));
     const jankFile = manifest.files.find((file) => file.path.endsWith(".jank.json"));
     manifest.cleanup = cleanup;
-    if (cleanupError) {
-      manifest.cleanupError = cleanupError;
-      if (manifest.status === "complete") manifest.status = "partial";
-    }
+    if (cleanupError) manifest.cleanupError = cleanupError;
+    const consent = manifest.evidence.consent;
+    const scroll = manifest.evidence.scroll;
+    const complete = manifest.validation.media.status === "valid"
+      && manifest.validation.jank.status === "valid"
+      && manifest.cleanup === "confirmed"
+      && manifest.evidence.gpu.status === "verified"
+      && manifest.evidence.egress?.status === "verified"
+      && manifest.evidence.egressAttestation?.schemaVersion === "runner-egress-boundary.v1"
+      && consent?.verified === true
+      && Array.isArray(consent.blindSpots) && consent.blindSpots.length === 0
+      && scroll?.completed === true && scroll?.truncated === false
+      && Array.isArray(manifest.evidence.interactionFailures)
+      && manifest.evidence.interactionFailures.length === 0;
+    manifest.status = complete ? "complete" : "partial";
     await writeFile(localManifest, JSON.stringify(manifest, null, 2));
     const contract = {
       contractVersion: CONTRACT_VERSION,
@@ -838,6 +984,7 @@ async function captureSiteMotionWithController(input, controller) {
       modes: manifest.modes,
       worker: { ...workerIdentity(), remoteRunDir, recorder: manifest.recorder || null },
       consent: jankReport.consent || null,
+      egress: manifest.evidence.egress,
       artifacts: {
         video: { path: localVideo, size: videoFile.size, sha256: videoFile.sha256 },
         jank: { path: localJank, size: jankFile.size, sha256: jankFile.sha256 },
@@ -1082,6 +1229,7 @@ export {
   trimOutput,
   validateMedia,
   validateJankReport,
+  validateEgressEvidence,
   assertPublicResolution,
   isPrivateAddress,
   resolvePublicAddresses,

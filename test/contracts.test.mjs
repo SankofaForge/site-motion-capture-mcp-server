@@ -3,8 +3,9 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { validateJankReport, validateMedia } from "../index.mjs";
+import { validateEgressEvidence, validateJankReport, validateMedia } from "../index.mjs";
 import { writeExecutable } from "./fixtures.mjs";
+import { fixtureEgressAttestation } from "./capture-cell-fixtures.mjs";
 
 test("recorder safety/reporting contract remains present", async () => {
   const source = await readFile(new URL("../remote/capture.mjs", import.meta.url), "utf8");
@@ -78,14 +79,17 @@ test("validateMedia covers ffprobe success and failure states", async () => {
   const invalid = join(dir, "invalid.webm");
   await writeFile(valid, "fixture");
   await writeFile(invalid, "fixture");
-  assert.deepEqual(await withFfprobe(JSON.stringify({ format: { format_name: "matroska,webm", duration: "2.5" } }), () => validateMedia(valid)), { status: "valid", format: "matroska,webm", durationSeconds: 2.5 });
+  const validProbe = JSON.stringify({ format: { format_name: "matroska,webm", duration: "2.5" }, streams: [{ codec_type: "video" }] });
+  assert.deepEqual(await withFfprobe(validProbe, () => validateMedia(valid)), { status: "valid", format: "matroska,webm", durationSeconds: 2.5, videoStreamCount: 1 });
   assert.deepEqual(await withFfprobe("not-json", () => validateMedia(invalid)), { status: "blocked", reason: "ffprobe returned invalid JSON" });
   assert.deepEqual(await withFfprobe(JSON.stringify({ format: { format_name: "matroska,webm", duration: "0" } }), () => validateMedia(invalid)), { status: "blocked", reason: "ffprobe returned no positive duration" });
-  assert.deepEqual(await withFfprobe(JSON.stringify({ format: { duration: "2.5" } }), () => validateMedia(invalid)), { status: "blocked", reason: "ffprobe returned no positive duration" });
-  assert.deepEqual(await withFfprobe(JSON.stringify({}), () => validateMedia(invalid)), { status: "blocked", reason: "ffprobe returned no positive duration" });
-  assert.deepEqual(await withFfprobe(JSON.stringify({ format: null }), () => validateMedia(invalid)), { status: "blocked", reason: "ffprobe returned no positive duration" });
+  assert.deepEqual(await withFfprobe(JSON.stringify({ format: { duration: "2.5" } }), () => validateMedia(invalid)), { status: "blocked", reason: "ffprobe did not identify WebM format" });
+  assert.deepEqual(await withFfprobe(JSON.stringify({}), () => validateMedia(invalid)), { status: "blocked", reason: "ffprobe did not identify WebM format" });
+  assert.deepEqual(await withFfprobe(JSON.stringify({ format: null }), () => validateMedia(invalid)), { status: "blocked", reason: "ffprobe did not identify WebM format" });
   assert.deepEqual(await withFfprobe(JSON.stringify({ format: { format_name: "matroska,webm", duration: "not-a-number" } }), () => validateMedia(invalid)), { status: "blocked", reason: "ffprobe returned no positive duration" });
   assert.deepEqual(await withFfprobe("", () => validateMedia(invalid)), { status: "blocked", reason: "ffprobe rejected the WebM" });
+  assert.deepEqual(await withFfprobe(JSON.stringify({ format: { format_name: "matroska", duration: "2.5" }, streams: [{ codec_type: "video" }] }), () => validateMedia(invalid)), { status: "blocked", reason: "ffprobe did not identify WebM format" });
+  assert.deepEqual(await withFfprobe(JSON.stringify({ format: { format_name: "matroska,webm", duration: "2.5" }, streams: [{ codec_type: "audio" }] }), () => validateMedia(invalid)), { status: "blocked", reason: "ffprobe found no video stream" });
 });
 
 test("validateMedia reports unavailable ffprobe as blocked", async () => {
@@ -140,11 +144,60 @@ test("structured capture response retains legacy artifact paths", async () => {
 
 test("jank validation rejects malformed reports", () => {
   assert.throws(() => validateJankReport(null), /jank validation failed/);
-  assert.deepEqual(validateJankReport({}), {});
-  assert.deepEqual(validateJankReport({ longTaskCount: 0, longTasks: [] }), { longTaskCount: 0, longTasks: [] });
-  assert.deepEqual(validateJankReport({ longTaskCount: 1, longTasks: [] }), { longTaskCount: 1, longTasks: [] });
-  assert.throws(() => validateJankReport({ longTaskCount: -1 }), /jank validation failed/);
-  assert.throws(() => validateJankReport({ longTaskCount: "invalid" }), /jank validation failed/);
-  assert.throws(() => validateJankReport({ longTasks: "invalid" }), /jank validation failed/);
+  const report = {
+    schemaVersion: "jank-report.v1",
+    status: "valid",
+    finalUrl: "https://fixture.test/",
+    viewport: { width: 1920, height: 1080, mobile: false, reducedMotion: false },
+    longTaskCount: 0,
+    longTasks: [],
+    totalBlockingTimeMs: 0,
+    thresholdMs: 200,
+    choppy: false,
+    byPhase: {},
+    observerError: null,
+    consent: { mode: "reject", verified: true, dismissed: false, actionTaken: false, blindSpots: [] },
+    scroll: { requested: true, completed: true, timedOut: false, truncated: false, actualDistance: 100, completedDistance: 100 },
+    interactionFailures: [],
+    interactions: [],
+  };
+  assert.deepEqual(validateJankReport(report), report);
+  assert.throws(() => validateJankReport({ ...report, longTaskCount: -1 }), /jank validation failed/);
+  assert.throws(() => validateJankReport({ ...report, longTaskCount: 1 }), /jank validation failed/);
+  assert.throws(() => validateJankReport({ ...report, longTasks: "invalid" }), /jank validation failed/);
+  assert.throws(() => validateJankReport({ ...report, viewport: { ...report.viewport, width: 390 } }, { width: 1920, height: 1080, mobile: false, reducedMotion: false }), /requested viewport mismatch/);
+  assert.throws(() => validateJankReport({ ...report, consent: { verified: true, blindSpots: "unknown" } }), /jank validation failed/);
   assert.throws(() => validateJankReport("invalid"), /jank validation failed/);
+});
+
+test("capture-cell egress evidence must prove the runner boundary for its exact URL host", () => {
+  const evidence = {
+    status: "verified",
+    boundaryId: "boundary-123",
+    directEgressBlocked: true,
+    proxyPolicy: "capture-exact-host.v1",
+    approvedHost: "fixture.test",
+    approvedProxyProbe: true,
+    networkNamespaceInode: 4026532001,
+  };
+  const attestation = fixtureEgressAttestation({ host: "fixture.test", boundaryId: evidence.boundaryId, namespaceInode: evidence.networkNamespaceInode });
+  assert.equal(validateEgressEvidence(evidence, "https://fixture.test/path", attestation), evidence);
+  assert.throws(() => validateEgressEvidence({ ...evidence, approvedHost: "other.test" }, "https://fixture.test/", attestation), /egress validation failed/);
+  assert.throws(() => validateEgressEvidence({ ...evidence, directEgressBlocked: false }, "https://fixture.test/", attestation), /egress validation failed/);
+  assert.throws(() => validateEgressEvidence({ ...evidence, networkNamespaceInode: "4026532001" }, "https://fixture.test/", attestation), /egress validation failed/);
+  assert.throws(() => validateEgressEvidence(evidence, "https://fixture.test/"), /egress validation failed/);
+  assert.throws(() => validateEgressEvidence(evidence, "https://fixture.test/", { ...attestation, networkNamespaceInode: "4026532001" }), /egress validation failed/);
+});
+
+test("rollback capture binds touch emulation and Chromium process to the attested namespace", async () => {
+  const recorder = await readFile(new URL("../remote/capture.mjs", import.meta.url), "utf8");
+  const bridge = await readFile(new URL("../index.mjs", import.meta.url), "utf8");
+  assert.match(recorder, /isMobile: args\.mobile/);
+  assert.match(recorder, /hasTouch: args\.mobile/);
+  assert.match(recorder, /browserServer\.process\(\)/);
+  assert.match(recorder, /\/proc\/\$\{browserProcess\.pid\}\/ns\/net/);
+  assert.match(recorder, /egress: egressEvidence, egressAttestation/);
+  assert.match(bridge, /wait "\$worker_pid"/);
+  assert.match(bridge, /egressAttestation: manifest\.egressAttestation/);
+  assert.match(bridge, /Keep the remote run directory when process exit or evidence validation is uncertain/);
 });
