@@ -6,6 +6,7 @@ import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tempDir, shimBin, writeExecutable } from "./fixtures.mjs";
+import { captureCellShimSource } from "./capture-cell-fixtures.mjs";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 
@@ -402,48 +403,14 @@ test("lock conflict reports capture_target_busy", async () => {
 test("validates manifest and output transfer with correct sha256 checksums", async () => {
   const bin = await shimBin();
   const out = await tempDir("manifest-test-");
-  await writeExecutable(bin, "ffprobe", `process.stdout.write(JSON.stringify({ format: { format_name: "matroska,webm", duration: "1.0" } }));`);
-  const videoBytes = Buffer.from("fake-webm-video-data");
-  const jankBytes = Buffer.from(JSON.stringify({ consent: { action: "rejected" }, longTaskCount: 0 }));
+  await writeExecutable(bin, "ffprobe", `process.stdout.write(JSON.stringify({ format: { format_name: "matroska,webm", duration: "1.0" }, streams: [{ codec_type: "video" }] }));`);
 
   await writeExecutable(bin, "ssh", `
 const arg = process.argv.join(" ");
 process.stdout.write("long output " + "a".repeat(4500) + "\\n");
 `);
 
-  await writeExecutable(bin, "scp", `
-const fs = require("node:fs");
-const crypto = require("node:crypto");
-const dest = process.argv.at(-1);
-
-if (dest.endsWith("manifest.json")) {
-  const videoData = Buffer.from("fake-webm-video-data");
-  const jankData = Buffer.from(JSON.stringify({ consent: { action: "rejected" }, longTaskCount: 0 }));
-  const stageDir = require("node:path").dirname(dest);
-  const runId = stageDir.replace(/^.*\\.capture-/, "");
-  const manifest = {
-    runId,
-    generatedAt: new Date().toISOString(),
-    files: [
-      {
-        path: "valid-run.webm",
-        size: videoData.length,
-        sha256: crypto.createHash("sha256").update(videoData).digest("hex"),
-      },
-      {
-        path: "valid-run.jank.json",
-        size: jankData.length,
-        sha256: crypto.createHash("sha256").update(jankData).digest("hex"),
-      },
-    ],
-  };
-  fs.writeFileSync(dest, JSON.stringify(manifest));
-} else if (dest.endsWith(".webm")) {
-  fs.writeFileSync(dest, Buffer.from("fake-webm-video-data"));
-} else if (dest.endsWith(".jank.json")) {
-  fs.writeFileSync(dest, Buffer.from(JSON.stringify({ consent: { action: "rejected" }, longTaskCount: 0 })));
-}
-`);
+  await writeExecutable(bin, "scp", captureCellShimSource({ name: "valid-run", mobile: true, consentMode: "granular" }));
 
   const replies = await server(
     [
@@ -460,7 +427,6 @@ if (dest.endsWith("manifest.json")) {
             hover_selector: ".menu-item",
             click_selector: ".cta-button",
             mobile: true,
-            no_scroll: true,
             consent_accept_approved: true,
             consent_mode: "granular",
             consent_settings_selector: ".settings",

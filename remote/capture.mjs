@@ -1,4 +1,4 @@
-import { mkdir, rename, writeFile, stat, readFile } from "node:fs/promises";
+import { mkdir, rename, writeFile, stat, readFile, readlink } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { lookup } from "node:dns/promises";
@@ -7,7 +7,8 @@ import { isIP } from "node:net";
 let chromium;
 
 const LONG_TASK_THRESHOLD_MS = 50; // browser's own definition of a "long task"
-const RECORDER_VERSION = "1.1.0";
+const RECORDER_VERSION = "1.2.0";
+const EGRESS_POLICY = "capture-exact-host.v1";
 
 function parseArgs(argv) {
   const args = {
@@ -147,14 +148,15 @@ async function installPublicRequestGuard(context, initialUrl, expectedAddresses)
   const initialHostname = new URL(initialUrl).hostname.toLowerCase().replace(/^\[|\]$/g, "");
   await context.route("**/*", async (route) => {
     const requestUrl = route.request().url();
-    if (!/^https?:\/\//i.test(requestUrl)) {
-      await route.continue();
+    let request;
+    try {
+      request = new URL(requestUrl);
+    } catch {
+      await route.abort("blockedbyclient");
       return;
     }
-    try {
-      const hostname = new URL(requestUrl).hostname.toLowerCase().replace(/^\[|\]$/g, "");
-      await assertRemotePublicResolution(requestUrl, hostname === initialHostname ? expectedAddresses : []);
-    } catch {
+    if (!/^https?:$/.test(request.protocol)
+      || request.hostname.toLowerCase().replace(/\.$/, "") !== initialHostname.replace(/\.$/, "")) {
       await route.abort("blockedbyclient");
       return;
     }
@@ -167,17 +169,147 @@ async function installPublicRequestGuard(context, initialUrl, expectedAddresses)
 // are captured for the whole session, not just after the script attaches.
 async function installJankObserver(page) {
   await page.addInitScript(() => {
-    window.__jankEntries = [];
+    const storageKey = "__siteMotionJankEntriesV1";
+    const saveState = () => {
+      try {
+        sessionStorage.setItem(storageKey, JSON.stringify({
+          entries: window.__jankEntries,
+          observerError: window.__jankObserverError || null,
+        }));
+      } catch {
+        window.__jankObserverError = "session_storage_write_failed";
+      }
+    };
+    try {
+      const stored = JSON.parse(sessionStorage.getItem(storageKey) || "null");
+      window.__jankEntries = Array.isArray(stored) ? stored : stored?.entries || [];
+      if (!Array.isArray(window.__jankEntries)) window.__jankEntries = [];
+      window.__jankObserverError = Array.isArray(stored) ? null : stored?.observerError || null;
+    } catch {
+      window.__jankEntries = [];
+      window.__jankObserverError = "session_storage_unavailable";
+    }
     try {
       const observer = new PerformanceObserver((list) => {
         for (const entry of list.getEntries()) {
-          window.__jankEntries.push({ startTime: entry.startTime, duration: entry.duration });
+          window.__jankEntries.push({
+            startTime: entry.startTime,
+            duration: entry.duration,
+            documentUrl: location.href,
+          });
         }
+        saveState();
       });
       observer.observe({ type: "longtask", buffered: true });
     } catch (e) {
       window.__jankObserverError = String(e);
+      saveState();
     }
+  });
+}
+
+function normalizedHost(rawUrl) {
+  return new URL(rawUrl).hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+}
+
+function namespaceInode(namespaceLink) {
+  const match = /^net:\[(\d+)\]$/.exec(namespaceLink);
+  if (!match) throw new Error("capture egress boundary namespace is unavailable");
+  const inode = Number(match[1]);
+  if (!Number.isSafeInteger(inode) || inode <= 0) throw new Error("capture egress boundary namespace inode is invalid");
+  return inode;
+}
+
+function validateEgressAttestation(attestation, {
+  url,
+  runnerInstanceId,
+  browserUseVersion,
+  networkNamespaceInode,
+  now = Date.now(),
+} = {}) {
+  const isRecord = attestation && typeof attestation === "object" && !Array.isArray(attestation);
+  const timestampPattern = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+  const checkedAt = isRecord && typeof attestation.checkedAt === "string" && timestampPattern.test(attestation.checkedAt) ? Date.parse(attestation.checkedAt) : NaN;
+  const expiresAt = isRecord && typeof attestation.expiresAt === "string" && timestampPattern.test(attestation.expiresAt) ? Date.parse(attestation.expiresAt) : NaN;
+  const approvedHost = isRecord && typeof attestation.approvedHost === "string"
+    ? attestation.approvedHost.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "")
+    : "";
+  const valid = isRecord
+    && attestation.schemaVersion === "runner-egress-boundary.v1"
+    && typeof attestation.boundaryId === "string" && attestation.boundaryId.length > 0
+    && Number.isFinite(checkedAt) && Number.isFinite(expiresAt)
+    && checkedAt <= now && now - checkedAt <= 120_000 && now < expiresAt && expiresAt - checkedAt <= 120_000
+    && typeof attestation.runnerInstanceId === "string" && attestation.runnerInstanceId === runnerInstanceId
+    && typeof attestation.browserExecutable === "string" && attestation.browserExecutable.length > 0
+    && typeof attestation.browserVersion === "string" && attestation.browserVersion.length > 0
+    && attestation.captureRuntime === "site-motion-capture"
+    && attestation.captureRuntimeVersion === RECORDER_VERSION
+    && typeof attestation.browserUseVersion === "string" && attestation.browserUseVersion === browserUseVersion
+    && approvedHost === normalizedHost(url)
+    && attestation.directEgressBlocked === true
+    && attestation.proxyPolicy === EGRESS_POLICY
+    && Number.isSafeInteger(attestation.networkNamespaceInode) && attestation.networkNamespaceInode > 0
+    && attestation.networkNamespaceInode === networkNamespaceInode
+    && attestation.controls?.direct?.status === "blocked"
+    && attestation.controls?.proxied?.status === "passed";
+  if (!valid) throw new Error("capture egress boundary attestation is missing, stale, or does not match this worker, browser, host, or network namespace");
+  return {
+    status: "verified",
+    boundaryId: attestation.boundaryId,
+    directEgressBlocked: true,
+    proxyPolicy: EGRESS_POLICY,
+    approvedHost,
+    approvedProxyProbe: true,
+    networkNamespaceInode,
+  };
+}
+
+async function readEgressAttestation(url) {
+  const attestationPath = process.env.CAPTURE_EGRESS_ATTESTATION_FILE;
+  const runnerInstanceId = process.env.VAST_INSTANCE_ID;
+  const browserUseVersion = process.env.EXPECTED_BROWSER_USE_VERSION;
+  if (!attestationPath || !runnerInstanceId || !browserUseVersion) {
+    throw new Error("capture egress boundary is not configured for this worker");
+  }
+  const info = await stat(attestationPath);
+  if (info.uid !== 0 || (info.mode & 0o022) !== 0) {
+    throw new Error("capture egress boundary attestation must be root-owned and not group/world writable");
+  }
+  const attestation = JSON.parse(await readFile(attestationPath, "utf8"));
+  if (!Number.isSafeInteger(attestation.networkNamespaceInode) || attestation.networkNamespaceInode <= 0) {
+    throw new Error("capture egress boundary attestation namespace inode must be a positive integer");
+  }
+  const currentNamespace = namespaceInode(await readlink("/proc/self/ns/net"));
+  return {
+    attestation,
+    evidence: validateEgressAttestation(attestation, {
+      url,
+      runnerInstanceId,
+      browserUseVersion,
+      networkNamespaceInode: currentNamespace,
+    }),
+    currentNamespace,
+  };
+}
+
+async function verifyBrowserEgressBoundary({ attestation, url, browserServer, browser, currentNamespace }) {
+  const browserProcess = browserServer.process();
+  if (!browserProcess?.pid) throw new Error("capture egress boundary could not identify the browser child process");
+  const browserNamespace = namespaceInode(await readlink(`/proc/${browserProcess.pid}/ns/net`));
+  const status = await readFile(`/proc/${browserProcess.pid}/status`, "utf8");
+  const parentPid = Number(/^PPid:\s*(\d+)$/m.exec(status)?.[1]);
+  const actualBrowserExecutable = chromium.executablePath();
+  const actualBrowserVersion = browser.version();
+  if (parentPid !== process.pid || browserNamespace !== currentNamespace
+    || attestation.browserExecutable !== actualBrowserExecutable
+    || attestation.browserVersion !== actualBrowserVersion) {
+    throw new Error("capture egress boundary does not match the launched browser process");
+  }
+  return validateEgressAttestation(attestation, {
+    url,
+    runnerInstanceId: process.env.VAST_INSTANCE_ID,
+    browserUseVersion: process.env.EXPECTED_BROWSER_USE_VERSION,
+    networkNamespaceInode: browserNamespace,
   });
 }
 
@@ -218,6 +350,7 @@ async function collectJankReport(page, args, phases, consent) {
     schemaVersion: "jank-report.v1",
     consent,
     finalUrl: page.url(),
+    viewport: { width: args.width, height: args.height, mobile: args.mobile, reducedMotion: args.reducedMotion },
     longTaskCount: longTasks.length,
     totalBlockingTimeMs: Math.round(totalBlockingTimeMs),
     thresholdMs: args.jankThreshold,
@@ -324,6 +457,34 @@ async function frameContainsConsentText(frame) {
 
 async function handleConsent(page, args, phase) {
   const result = emptyConsentResult(args.consentMode, phase);
+  if (args.consentMode === "none") {
+    const scopes = `${KNOWN_CONSENT_SCOPES}, ${GENERIC_CONSENT_SCOPES}`;
+    try {
+      const frames = page.frames();
+      if (frames.length === 0) throw new Error("page exposed no frames for consent inspection");
+      for (const frame of frames) {
+        const surfaces = frame.locator(scopes);
+        const count = await withTimeout(surfaces.count(), 1000, "consent surface scan");
+        for (let index = 0; index < count; index++) {
+          const surface = surfaces.nth(index);
+          if (!(await withTimeout(surface.isVisible({ timeout: 250 }), 1000, "consent visibility scan"))) continue;
+          const relevant = await withTimeout(surface.evaluate((element) => {
+            const known = element.matches("[role='dialog'], [aria-modal='true'], #onetrust-banner-sdk, #CybotCookiebotDialog, #didomi-host");
+            if (known) return true;
+            const text = `${element.innerText || ""} ${element.getAttribute("aria-label") || ""} ${element.getAttribute("aria-describedby") || ""}`;
+            return /cookie|consent|privacy|tracking|personal data/i.test(text.slice(0, 20000));
+          }), 1000, "consent relevance scan");
+          if (relevant) result.surfacePresent = true;
+        }
+      }
+    } catch (error) {
+      result.blindSpots.push({ kind: "consent-inspection-failed", error: error.message });
+    }
+    result.verified = result.surfacePresent !== true && result.blindSpots.length === 0;
+    result.outcome = result.verified ? "no-consent-surface" : result.surfacePresent ? "consent-surface-present" : "consent-check-timeout";
+    result.reason = result.verified ? "consent mode none; page was inspected without interaction" : "consent mode none; consent state could not be verified";
+    return result;
+  }
   if (args.consentMode === "accept" && args.consentAcceptApproved !== true) {
     result.outcome = "accept-approval-required";
     result.reason = "accept mode is fail-closed without consent_accept_approved=true";
@@ -464,8 +625,7 @@ async function handleConsent(page, args, phase) {
   result.dismissed = result.verified && result.actionTaken && args.consentMode !== "none";
   result.outcome = result.verified ? (result.actionTaken ? "dismissed" : "no-consent-surface") : result.outcome === "action-taken" ? "surface-remains-or-unverified" : result.outcome;
   result.clicks = clicks; result.budgetMs = Date.now() - started;
-  if (args.consentMode === "none") result.outcome = result.verified ? "no-consent-surface" : "consent-surface-present";
-  else if (!result.verified && !result.actionTaken) result.outcome = "no-safe-action";
+  if (!result.verified && !result.actionTaken) result.outcome = "no-safe-action";
   return result;
 }
 
@@ -571,7 +731,7 @@ async function autoDiscoverAndInteract(page, args) {
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.selfTest) return runConsentSelfTest();
-  await assertRemotePublicResolution(args.url, args.expectedAddresses);
+  const { attestation: egressAttestation, currentNamespace } = await readEgressAttestation(args.url);
   ({ chromium } = await import("playwright"));
   await mkdir(args.out, { recursive: true });
 
@@ -589,20 +749,39 @@ async function main() {
         "--ignore-gpu-blocklist",
       ]
     : [];
-  const browser = await chromium.launch({ headless: true, args: launchArgs });
+  const browserServer = await chromium.launchServer({ headless: true, args: launchArgs });
+  let browser = null;
+  let egressEvidence = null;
   let cleaning = false;
-  const cleanup = async () => { if (!cleaning) { cleaning = true; await browser.close().catch(() => {}); } };
+  const cleanup = async () => {
+    if (!cleaning) {
+      cleaning = true;
+      await browser?.close().catch(() => {});
+      await browserServer.close().catch(() => {});
+    }
+  };
   const onSignal = () => { void cleanup().finally(() => process.exit(130)); };
   process.once("SIGINT", onSignal); process.once("SIGTERM", onSignal);
   let context = null;
   let page = null;
   let preflightContext = null;
   try {
+  browser = await chromium.connect(browserServer.wsEndpoint());
+  egressEvidence = await verifyBrowserEgressBoundary({
+    attestation: egressAttestation,
+    url: args.url,
+    browserServer,
+    browser,
+    currentNamespace,
+  });
   let preflightState = null;
   let preflightConsent = null;
   if (args.consentMode !== "none" && args.consentPreflight) {
     preflightContext = await browser.newContext({
       viewport: { width: args.width, height: args.height },
+      isMobile: args.mobile,
+      hasTouch: args.mobile,
+      serviceWorkers: "block",
     });
     await installPublicRequestGuard(preflightContext, args.url, args.expectedAddresses);
     const preflightPage = await preflightContext.newPage();
@@ -613,6 +792,9 @@ async function main() {
   }
   context = await browser.newContext({
     viewport: { width: args.width, height: args.height },
+    isMobile: args.mobile,
+    hasTouch: args.mobile,
+    serviceWorkers: "block",
     reducedMotion: args.reducedMotion ? "reduce" : "no-preference",
     recordVideo: { dir: args.out, size: { width: args.width, height: args.height } },
     ...(preflightState ? { storageState: preflightState } : {}),
@@ -626,7 +808,7 @@ async function main() {
   const phases = [];
   const interactionFailures = [];
   const interactions = [];
-  const scrollEvidence = { requested: args.scroll, completed: !args.scroll, requestedDistance: args.scrollDistance, measuredDistance: null, completedDistance: 0, actualDistance: 0, timedOut: false, truncated: false };
+  const scrollEvidence = { requested: args.scroll, completed: false, requestedDistance: args.scrollDistance, measuredDistance: null, completedDistance: 0, actualDistance: 0, timedOut: false, truncated: false };
 
   console.error(`Navigating to ${args.url}`);
   await page.goto(args.url, { waitUntil: "load", timeout: 60_000 });
@@ -661,6 +843,9 @@ async function main() {
 
   if (args.autoDiscover) {
     interactions.push(...await autoDiscoverAndInteract(page, args));
+    interactionFailures.push(...interactions
+      .filter((interaction) => interaction.status === "failed")
+      .map((interaction) => ({ kind: "auto-discover", index: interaction.index, error: interaction.error || "interaction failed" })));
   }
   await markPhase(page, phases, "auto-discover");
 
@@ -728,12 +913,19 @@ async function main() {
   await delayedCheck(page, "before-finalization");
   const finalConsent = await runConsentBounded(page, args, "before-finalization");
   consent = combineConsentResults(args.consentMode, consent.recorded || recordedConsent, finalConsent);
+  egressEvidence = await verifyBrowserEgressBoundary({
+    attestation: egressAttestation,
+    url: args.url,
+    browserServer,
+    browser,
+    currentNamespace,
+  });
   const jankReport = args.jankCheck ? await collectJankReport(page, args, phases, consent) : null;
   if (jankReport) {
     jankReport.interactionFailures = interactionFailures;
     jankReport.interactions = interactions;
     jankReport.scroll = scrollEvidence;
-    jankReport.status = interactionFailures.length || scrollEvidence.timedOut || scrollEvidence.truncated || consent?.blindSpots?.length || consent?.verified === false || jankReport.observerError ? "partial" : "valid";
+    jankReport.status = interactionFailures.length || !scrollEvidence.completed || scrollEvidence.timedOut || scrollEvidence.truncated || consent?.blindSpots?.length || consent?.verified === false || jankReport.observerError ? "partial" : "valid";
   }
 
   const video = page.video();
@@ -742,6 +934,7 @@ async function main() {
   await context.close();
   context = null;
   await browser.close();
+  await browserServer.close();
   cleaning = true;
   process.removeListener("SIGINT", onSignal); process.removeListener("SIGTERM", onSignal);
   const videoPath = await video.path();
@@ -767,7 +960,7 @@ async function main() {
     }
   }
 
-  const manifestPath = await writeManifest(args.out, [finalPath, ...(jankReport ? [path.join(args.out, `${stem}.jank.json`)] : [])], args.runId, { url: args.url, finalUrl: jankReport?.finalUrl || args.url, viewport: { width: args.width, height: args.height, mobile: args.mobile, reducedMotion: args.reducedMotion }, modes: { gpu: args.gpu, scroll: args.scroll } });
+  const manifestPath = await writeManifest(args.out, [finalPath, ...(jankReport ? [path.join(args.out, `${stem}.jank.json`)] : [])], args.runId, { url: args.url, finalUrl: jankReport?.finalUrl || args.url, viewport: { width: args.width, height: args.height, mobile: args.mobile, reducedMotion: args.reducedMotion }, modes: { gpu: args.gpu, scroll: args.scroll }, egress: egressEvidence, egressAttestation });
   console.error(`Manifest written to ${manifestPath}`);
 
   console.log(finalPath);

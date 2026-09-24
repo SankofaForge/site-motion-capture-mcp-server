@@ -8,7 +8,7 @@ async function loadConsent() {
   let source = await readFile(new URL("../remote/capture.mjs", import.meta.url), "utf8");
   source = source.replace('import { chromium } from "playwright";', "const chromium = {};" );
   source = source.replace(/\nmain\(\)\.catch\([\s\S]*$/, "");
-  source += "\nexport { handleConsent, combineConsentResults, emptyConsentResult, parseArgs, writeManifest };\n";
+  source += "\nexport { handleConsent, combineConsentResults, emptyConsentResult, parseArgs, writeManifest, validateEgressAttestation, namespaceInode, installJankObserver };\n";
   return import(`data:text/javascript,${encodeURIComponent(source)}`);
 }
 
@@ -116,6 +116,69 @@ test("none and complete/missing result fields are deterministic", async () => {
   assert.equal(combined.dismissed, false);
   assert.equal(combined.verified, false);
   assert.equal(combined.recorded.selector, "x");
+});
+
+test("consent mode none inspects a visible surface without waiting or clicking", async () => {
+  const { handleConsent } = await loadConsent();
+  const waits = [];
+  const frame = fakeFrame({
+    body: "Cookie consent options",
+    controls: { "#onetrust-reject-all": { clicked: () => assert.fail("consent mode none clicked a control") } },
+  });
+  const result = await handleConsent(fakeConsentPage({ frames: [frame], waits }), {
+    consentMode: "none", consentWait: 5000, consentBudgetMs: 8000, consentMaxClicks: 6, consentSelectors: ["#onetrust-reject-all"],
+  }, "recorded");
+  assert.equal(result.verified, false);
+  assert.equal(result.actionTaken, false);
+  assert.equal(result.dismissed, false);
+  assert.equal(result.outcome, "consent-surface-present");
+  assert.deepEqual(result.attempts, []);
+  assert.deepEqual(waits, []);
+});
+
+test("egress attestation binds fresh proof to host, runner, runtime, browser, and namespace", async () => {
+  const { validateEgressAttestation } = await loadConsent();
+  const now = Date.now();
+  const attestation = {
+    schemaVersion: "runner-egress-boundary.v1",
+    boundaryId: "capture-boundary-1",
+    checkedAt: new Date(now - 1000).toISOString(),
+    expiresAt: new Date(now + 30000).toISOString(),
+    runnerInstanceId: "runner-1",
+    browserExecutable: "/opt/chromium/chrome",
+    browserVersion: "140.0.7339.0",
+    captureRuntime: "site-motion-capture",
+    captureRuntimeVersion: "1.2.0",
+    browserUseVersion: "0.13.10",
+    approvedHost: "fixture.test",
+    directEgressBlocked: true,
+    proxyPolicy: "capture-exact-host.v1",
+    approvedProxyProbe: true,
+    networkNamespaceInode: 4026532001,
+    controls: { direct: { status: "blocked" }, proxied: { status: "passed" } },
+  };
+  const bindings = {
+    url: "https://fixture.test/path",
+    runnerInstanceId: "runner-1",
+    browserUseVersion: "0.13.10",
+    networkNamespaceInode: 4026532001,
+    now,
+  };
+  const evidence = validateEgressAttestation(attestation, bindings);
+  assert.equal(evidence.status, "verified");
+  assert.equal(evidence.approvedHost, "fixture.test");
+  assert.throws(() => validateEgressAttestation(attestation, { ...bindings, url: "https://other.test/" }), /egress boundary attestation/);
+  assert.throws(() => validateEgressAttestation(attestation, { ...bindings, networkNamespaceInode: 4026532002 }), /egress boundary attestation/);
+  assert.throws(() => validateEgressAttestation({ ...attestation, controls: { direct: { status: "passed" }, proxied: { status: "passed" } } }, bindings), /egress boundary attestation/);
+  assert.throws(() => validateEgressAttestation(attestation, { ...bindings, now: now + 31000 }), /egress boundary attestation/);
+});
+
+test("jank observer persists entries across same-origin document navigation", async () => {
+  const { installJankObserver } = await loadConsent();
+  let installed;
+  await installJankObserver({ addInitScript: async (script) => { installed = script; } });
+  assert.match(installed.toString(), /sessionStorage/);
+  assert.match(installed.toString(), /documentUrl/);
 });
 
 test("click failures, max candidates, and chained result attempts do not throw", async () => {
