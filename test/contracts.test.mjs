@@ -90,6 +90,8 @@ test("validateMedia covers ffprobe success and failure states", async () => {
   assert.deepEqual(await withFfprobe("", () => validateMedia(invalid)), { status: "blocked", reason: "ffprobe rejected the WebM" });
   assert.deepEqual(await withFfprobe(JSON.stringify({ format: { format_name: "matroska", duration: "2.5" }, streams: [{ codec_type: "video" }] }), () => validateMedia(invalid)), { status: "blocked", reason: "ffprobe did not identify WebM format" });
   assert.deepEqual(await withFfprobe(JSON.stringify({ format: { format_name: "matroska,webm", duration: "2.5" }, streams: [{ codec_type: "audio" }] }), () => validateMedia(invalid)), { status: "blocked", reason: "ffprobe found no video stream" });
+  assert.deepEqual(await withFfprobe(JSON.stringify({ format: { format_name: "matroska,webm", duration: "2.5" }, streams: [null, { codec_type: "video" }] }), () => validateMedia(valid)), { status: "valid", format: "matroska,webm", durationSeconds: 2.5, videoStreamCount: 1 });
+  assert.deepEqual(await withFfprobe(JSON.stringify({ format: { format_name: "matroska,webm", duration: "2.5" }, streams: null }), () => validateMedia(invalid)), { status: "blocked", reason: "ffprobe found no video stream" });
 });
 
 test("validateMedia reports unavailable ffprobe as blocked", async () => {
@@ -162,10 +164,30 @@ test("jank validation rejects malformed reports", () => {
     interactions: [],
   };
   assert.deepEqual(validateJankReport(report), report);
+  assert.throws(() => validateJankReport({ ...report, finalUrl: "" }), /jank validation failed/);
+  const longTask = { startTime: 10, duration: 51, documentUrl: report.finalUrl };
+  assert.deepEqual(validateJankReport({ ...report, longTaskCount: 1, longTasks: [longTask] }), {
+    ...report,
+    longTaskCount: 1,
+    longTasks: [longTask],
+  });
+  assert.equal(validateJankReport({ ...report, longTaskCount: 1, longTasks: [{ ...longTask, duration: 50 }] }).longTasks[0].duration, 50);
+  assert.throws(() => validateJankReport({ ...report, longTaskCount: 1, longTasks: [{ ...longTask, duration: 49 }] }), /jank validation failed/);
+  assert.throws(() => validateJankReport({ ...report, consent: { ...report.consent, mode: "none", actionTaken: true } }), /jank validation failed/);
+  assert.throws(() => validateJankReport({ ...report, consent: { ...report.consent, mode: "none", dismissed: true } }), /jank validation failed/);
+  assert.throws(() => validateJankReport({ ...report, consent: { ...report.consent, verified: false } }), /valid status contradicts report evidence/);
+  assert.throws(() => validateJankReport({ ...report, consent: { ...report.consent, blindSpots: ["consent scan incomplete"] } }), /valid status contradicts report evidence/);
+  assert.throws(() => validateJankReport({ ...report, scroll: { ...report.scroll, completed: false } }), /valid status contradicts report evidence/);
+  assert.throws(() => validateJankReport({ ...report, scroll: { ...report.scroll, truncated: true } }), /valid status contradicts report evidence/);
+  assert.throws(() => validateJankReport({ ...report, interactionFailures: [{ kind: "click" }] }), /valid status contradicts report evidence/);
+  assert.throws(() => validateJankReport({ ...report, interactions: [{ status: "failed" }] }), /valid status contradicts report evidence/);
+  assert.throws(() => validateJankReport({ ...report, observerError: "observer_failed" }), /valid status contradicts report evidence/);
   assert.throws(() => validateJankReport({ ...report, longTaskCount: -1 }), /jank validation failed/);
   assert.throws(() => validateJankReport({ ...report, longTaskCount: 1 }), /jank validation failed/);
   assert.throws(() => validateJankReport({ ...report, longTasks: "invalid" }), /jank validation failed/);
   assert.throws(() => validateJankReport({ ...report, viewport: { ...report.viewport, width: 390 } }, { width: 1920, height: 1080, mobile: false, reducedMotion: false }), /requested viewport mismatch/);
+  assert.throws(() => validateJankReport(report, { width: 1920, height: 1080, mobile: false, reducedMotion: false, finalUrl: "https://other.test/" }), /final URL mismatch/);
+  assert.deepEqual(validateJankReport(report, { width: 1920, height: 1080, mobile: false, reducedMotion: false }), report);
   assert.throws(() => validateJankReport({ ...report, consent: { verified: true, blindSpots: "unknown" } }), /jank validation failed/);
   assert.throws(() => validateJankReport("invalid"), /jank validation failed/);
 });
@@ -185,6 +207,11 @@ test("capture-cell egress evidence must prove the runner boundary for its exact 
   assert.throws(() => validateEgressEvidence({ ...evidence, approvedHost: "other.test" }, "https://fixture.test/", attestation), /egress validation failed/);
   assert.throws(() => validateEgressEvidence({ ...evidence, directEgressBlocked: false }, "https://fixture.test/", attestation), /egress validation failed/);
   assert.throws(() => validateEgressEvidence({ ...evidence, networkNamespaceInode: "4026532001" }, "https://fixture.test/", attestation), /egress validation failed/);
+  assert.throws(() => validateEgressEvidence({ ...evidence, networkNamespaceInode: 0 }, "https://fixture.test/", attestation), /egress validation failed/);
+  assert.throws(() => validateEgressEvidence({ ...evidence, boundaryId: "" }, "https://fixture.test/", attestation), /egress validation failed/);
+  assert.throws(() => validateEgressEvidence({ ...evidence, proxyPolicy: "other-policy" }, "https://fixture.test/", attestation), /egress validation failed/);
+  assert.throws(() => validateEgressEvidence({ ...evidence, approvedProxyProbe: false }, "https://fixture.test/", attestation), /egress validation failed/);
+  assert.throws(() => validateEgressEvidence({ ...evidence, status: "partial" }, "https://fixture.test/", attestation), /egress validation failed/);
   assert.throws(() => validateEgressEvidence(evidence, "https://fixture.test/"), /egress validation failed/);
   assert.throws(() => validateEgressEvidence(evidence, "https://fixture.test/", { ...attestation, networkNamespaceInode: "4026532001" }), /egress validation failed/);
 });

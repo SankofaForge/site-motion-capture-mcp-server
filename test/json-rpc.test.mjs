@@ -64,6 +64,57 @@ process.stdout.write(process.argv.join(" ").includes("capture.mjs") ? "fixture\\
   assert.match(callsText, /--consent-budget-ms' '8000'/);
 });
 
+test("unverified runner egress is returned as a blocked capture reason", async () => {
+  const bin = await shimBin();
+  const out = await tempDir("site-motion-egress-blocked-");
+  await writeExecutable(bin, "ssh", `
+const args = process.argv.join(" ");
+if (args.includes("capture.mjs") && args.includes("--url")) {
+  process.stderr.write("capture egress boundary attestation is missing");
+  process.exit(1);
+}
+process.stdout.write("ok\\n");
+`);
+  const replies = await server([{ jsonrpc: "2.0", id: 82, method: "tools/call", params: {
+    name: "capture_site_motion", arguments: { url: "https://example.test", name: "egress-blocked", output_dir: out, gpu: false },
+  } }], { PATH: `${bin}:${process.env.PATH}`, SITE_MOTION_SSH_URL: "ssh://root@fixture.test:22" });
+  assert.equal(replies[0].result.isError, true);
+  assert.equal(replies[0].result.structuredContent.reasonCode, "capture-egress-unverified");
+});
+
+test("capture rejects manifest viewport and final URL mismatches", async () => {
+  const bin = await shimBin();
+  const out = await tempDir("site-motion-manifest-mismatch-");
+  await writeExecutable(bin, "ssh", `process.stdout.write("fixture\\n");`);
+  await writeExecutable(bin, "ffprobe", `process.stdout.write(JSON.stringify({ format: { format_name: "matroska,webm", duration: "1.0" }, streams: [{ codec_type: "video" }] }));`);
+  const scenarios = [
+    {
+      name: "viewport-mismatch",
+      source: captureCellShimSource({ name: "viewport-mismatch" }).replace(
+        '"viewport":{"width":1920,"height":1080,"mobile":false,"reducedMotion":false}',
+        '"viewport":{"width":1919,"height":1080,"mobile":false,"reducedMotion":false}',
+      ),
+      expected: /requested viewport mismatch/,
+    },
+    {
+      name: "url-mismatch",
+      source: captureCellShimSource({ name: "url-mismatch" }).replace(
+        '"finalUrl":"https://example.test/"',
+        '"finalUrl":"https://other.test/"',
+      ),
+      expected: /final URL mismatch/,
+    },
+  ];
+  for (const scenario of scenarios) {
+    await writeExecutable(bin, "scp", scenario.source);
+    const replies = await server([{ jsonrpc: "2.0", id: 83, method: "tools/call", params: {
+      name: "capture_site_motion", arguments: { url: "https://example.test", name: scenario.name, output_dir: out, gpu: false },
+    } }], { PATH: `${bin}:${process.env.PATH}`, SITE_MOTION_SSH_URL: "ssh://root@fixture.test:22" });
+    assert.equal(replies[0].result.isError, true);
+    assert.match(replies[0].result.content[0].text, scenario.expected);
+  }
+});
+
 test("local evidence survives remote cleanup failure and reports pending cleanup", async () => {
   const bin = await shimBin();
   const out = await tempDir("site-motion-cleanup-");
